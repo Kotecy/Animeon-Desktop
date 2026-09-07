@@ -24,10 +24,7 @@
     try { await host()?.storeSet(key, val) } catch {}
   }
 
-  /* ═══════════════ Детектор аномалий (только наблюдает) ═══════════════ */
-  // Легальный помощник: НИКОГДА не кликает по странице. Видит кнопку
-  // аномалии в DOM или eligible-состояние сервера — зовёт приложение
-  // (звук + тост + журнал). Собирает пользователь вручную.
+  // Observe by default; collecting requires an explicit run-only switch.
   const ANOMALY_SELECTOR = 'button.anomaly-orb-root,button[aria-label="Аномалия — собрать награду"]'
   const ANOMALY_STATE_URL = '/api/event/boar/anomaly/state'
   const DETECT_SCAN_MS = 500
@@ -126,6 +123,12 @@
           if (eligible && !detServerEligible) {
             await handleAnomalySeen(document.querySelector(ANOMALY_SELECTOR), 'server')
           }
+          if (!eligible) await host()?.anomalyAction('gone')
+          // Collect via the confirmed empty-body POST, without DOM or reload.
+          if (eligible) {
+            const d = await storeGet('detector')
+            if (d?.watching && d?.autoCollect) await host()?.anomalyClaim()
+          }
           detServerEligible = eligible
           delay = eligible ? DETECT_STATE_READY_MS : DETECT_STATE_WAIT_MS
         }
@@ -183,22 +186,13 @@
   setInterval(fixProfileMenu, MENU_FIX_MS)
 
   /* ═══════════════ Автоподписка (взаимная подписка) ═══════════════ */
-  // Порт логики расширения. Отличия от расширения:
-  // - хранилище — electron-store через window.__animeon (main), а не chrome.storage;
-  // - нет привязки к "вкладке 2": лидер выбирается через блокировку в store,
-  //   чтобы цикл не гонялся параллельно во всех вкладках;
-  // - ownSlug кэшируется только в памяти: store общий для всех профилей,
-  //   а done/failure-бакеты ключуются по slug владельца (своему нику).
+  // Authenticated self identity and complete live lists. Main owns per-profile locks.
   const FOLLOWBACK_CHECK_MS = 180000
-  const FOLLOWBACK_PAGE_SIZE = 50
-  const FOLLOWBACK_MAX_PAGES = 5
-  const FOLLOWBACK_RETRY_COOLDOWN_MS = 10 * 60 * 1000
   const FOLLOWBACK_MAX_PER_RUN = 5
   // Короткий TTL: каждая перезагрузка/навигация рождает новый INSTANCE_ID,
   // а метка в общем store остаётся за мёртвым инстансом. С длинным TTL новый
   // контекст до 6 минут получал отказ в лидерстве — проверки вставали.
   // 45с достаточно против параллельных прогонов (интервал 3 мин).
-  const FOLLOWBACK_CLAIM_TTL_MS = 45000
   const FETCH_TIMEOUT_MS = 20000
   async function fetchWithTimeout(url: string, init?: RequestInit, ms = FETCH_TIMEOUT_MS): Promise<Response> {
     const ctrl = new AbortController()
@@ -207,162 +201,61 @@
       return await fetch(url, { ...(init || {}), signal: ctrl.signal })
     } finally { clearTimeout(t) }
   }
-  const FOLLOWBACK_FIRST_DELAY_MS = 15000
-  const FOLLOWING_CACHE_MS = 300000
   const FB_LOG = '[AnimeonDesktop follow-back]'
-  const INSTANCE_ID = Math.random().toString(36).slice(2) + Date.now().toString(36)
 
   function sleep(ms: number) {
     return new Promise((resolve) => setTimeout(resolve, ms))
   }
 
-  function detectOwnUsernameFromDom(): string | null {
-    const candidates = Array.from(document.querySelectorAll('a'))
-    for (const el of candidates) {
-      const href = el.getAttribute('href') || ''
-      const match = href.match(/^\/user\/([^/?#]+)$/i)
-      if (!match) continue
-      const text = (el.textContent || '').trim().toLowerCase()
-      if (text.includes('как видят другие') || text.includes('мой профиль')) {
-        return decodeURIComponent(match[1])
-      }
-    }
-    return null
-  }
-
-  let ownSlugWatcherStarted = false
-  let ownSlugMemory: string | null = null
-  let lastSlugScan = 0
-  function startOwnSlugWatcher() {
-    if (ownSlugWatcherStarted) return
-    ownSlugWatcherStarted = true
-    const obs = new MutationObserver(() => {
-      // Страница может мутировать постоянно (анимации, плеер, чат) —
-      // сканируем ссылки не чаще раза в 2 секунды.
-      const now = Date.now()
-      if (now - lastSlugScan < 2000) return
-      lastSlugScan = now
-      const slug = detectOwnUsernameFromDom()
-      if (!slug) return
-      obs.disconnect()
-      ownSlugMemory = slug
-      console.log(FB_LOG, 'detected own slug via DOM watcher:', slug)
-      checkFollowBacks(true)
-    })
-    obs.observe(document.documentElement, { childList: true, subtree: true })
-  }
-
+  const normalizeNick = (value: unknown) => String(value || '').normalize('NFKC').trim().replace(/^@/, '').toLowerCase()
   async function resolveOwnApiSegment(): Promise<string | null> {
-    if (ownSlugMemory) return ownSlugMemory
-    try {
-      const me = await fetchWithTimeout('/api/users/me', { credentials: 'include' })
-      if (me.ok) {
-        const j = await me.json().catch(() => null)
-        const slug = j && (j.username_slug || j.slug || j.username)
-        if (slug && slug !== 'me') {
-          ownSlugMemory = String(slug)
-          console.log(FB_LOG, 'resolved own slug via /api/users/me:', ownSlugMemory)
-          return ownSlugMemory
-        }
-      }
-    } catch {}
-    try {
-      const keyRe = /user|auth|session|account|profile|persist|pinia/i
-      const slugRe = /"username_slug"\s*:\s*"([^"]+)"/
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i)
-        if (!k || !keyRe.test(k)) continue
-        const raw = localStorage.getItem(k)
-        if (!raw) continue
-        const m = raw.match(slugRe)
-        if (m && m[1] && m[1] !== 'me') {
-          ownSlugMemory = m[1]
-          console.log(FB_LOG, 'resolved own slug from localStorage key "' + k + '":', m[1])
-          return ownSlugMemory
-        }
-      }
-    } catch {}
-    try {
-      const slugRe = /"username_slug"\s*:\s*"([^"]+)"/
-      for (const s of Array.from(document.querySelectorAll('script'))) {
-        const text = s.textContent || ''
-        if (text.indexOf('username_slug') === -1) continue
-        const m = text.match(slugRe)
-        if (m && m[1] && m[1] !== 'me') {
-          ownSlugMemory = m[1]
-          console.log(FB_LOG, 'resolved own slug from page hydration state:', m[1])
-          return ownSlugMemory
-        }
-      }
-    } catch {}
-    try {
-      const test = await fetchWithTimeout('/api/users/me/followers?page=1&per_page=1', { credentials: 'include' })
-      if (test.ok) {
-        ownSlugMemory = 'me'
-        console.log(FB_LOG, 'using /me shortcut')
-        return 'me'
-      }
-    } catch {}
-    try {
-      const profileResp = await fetchWithTimeout('/profile', { credentials: 'include' })
-      if (profileResp.ok) {
-        const html = await profileResp.text()
-        const match = html.match(/href="\/user\/([^"?#]+)"/i)
-        if (match) {
-          ownSlugMemory = decodeURIComponent(match[1])
-          console.log(FB_LOG, 'resolved own slug from /profile page HTML:', ownSlugMemory)
-          return ownSlugMemory
-        }
-      } else {
-        console.log(FB_LOG, '/profile fetch returned', profileResp.status)
-      }
-    } catch (e) {
-      console.log(FB_LOG, '/profile fetch failed', e)
+    // Only authenticated self endpoints; never infer the owner from another user's page.
+    for (const url of ['/api/auth/me', '/api/users/me', '/api/user/profile', '/api/profile']) {
+      const response = await fetchWithTimeout(url, { credentials: 'include', cache: 'no-store' })
+      if (response.status === 401 || response.status === 403) return null
+      if (!response.ok) continue
+      const body = await response.json().catch(() => null)
+      const data = body?.data || body
+      const user = data?.user || data?.profile || data
+      const slug = user?.username_slug || user?.slug || user?.username || user?.nickname
+      if (typeof slug === 'string' && slug.trim() && normalizeNick(slug) !== 'me') return slug.trim()
     }
-    const detected = detectOwnUsernameFromDom()
-    if (detected) {
-      ownSlugMemory = detected
-      console.log(FB_LOG, 'detected own slug from link on current page:', detected)
-      return detected
-    }
-    startOwnSlugWatcher()
-    console.log(FB_LOG, 'could not resolve own account yet — watching DOM in background for the self-profile link')
     return null
   }
 
-  let followingCache: { slugs: string[] | null, caseMap: Record<string, string>, total: number, at: number } = { slugs: null, caseMap: {}, total: Infinity, at: 0 }
-  async function fetchFollowingData(ownSegment: string): Promise<{ slugs: string[], caseMap: Map<string, string>, total: number, complete: boolean } | null> {
-    if (followingCache.slugs && Date.now() - followingCache.at < FOLLOWING_CACHE_MS) {
-      return { slugs: followingCache.slugs, caseMap: new Map(Object.entries(followingCache.caseMap)), total: followingCache.total, complete: followingCache.total <= FOLLOWBACK_MAX_PAGES * FOLLOWBACK_PAGE_SIZE }
-    }
-    const slugs: string[] = []
-    const caseMap = new Map<string, string>()
-    let total = Infinity
-    for (let page = 1; page <= FOLLOWBACK_MAX_PAGES && (page - 1) * FOLLOWBACK_PAGE_SIZE < total; page++) {
-      let resp: Response
-      try {
-          resp = await fetchWithTimeout(
-            `/api/users/${encodeURIComponent(ownSegment)}/following?page=${page}&per_page=${FOLLOWBACK_PAGE_SIZE}`,
-            { credentials: 'include' }
-          )
-      } catch { return null }
-      if (!resp.ok) return null
-      const data = await resp.json().catch(() => null)
-      if (!data) return null
-      total = typeof data.total === 'number' ? data.total : 0
-      const users = Array.isArray(data) ? data : (Array.isArray(data.users) ? data.users : [])
-      for (const u of users) {
-        const orig = u.username_slug || u.slug || u.username
-        if (orig) {
-          const s = String(orig).toLowerCase()
-          slugs.push(s)
-          if (!caseMap.has(s)) caseMap.set(s, String(orig))
-        }
+  async function readRelations(owner: string, kind: 'followers' | 'following') {
+    const users = new Map<string, { slug: string, aliases: string[] }>()
+    let expected: number | null = null
+    for (let page = 1; page <= 100; page++) {
+      if (!(await host()?.followbackClaim(owner, true))?.ok) throw new Error('Проверка остановлена')
+      const response = await fetchWithTimeout(
+        `/api/users/${encodeURIComponent(owner)}/${kind}?page=${page}&per_page=50`,
+        { credentials: 'include', cache: 'no-store' })
+      if (!response.ok) throw new Error(`Не удалось загрузить ${kind === 'followers' ? 'подписчиков' : 'подписки'} (HTTP ${response.status})`)
+      const body = await response.json()
+      const data = body?.data ?? body
+      const rows = Array.isArray(data) ? data : data?.users
+      if (!Array.isArray(rows)) throw new Error('Неизвестный формат списка; действия отменены')
+      const total = body?.total ?? data?.total
+      if (total != null) {
+        if (!Number.isSafeInteger(total) || total < 0 || (expected !== null && total !== expected)) throw new Error('Список изменился во время загрузки; повторим проверку')
+        expected = total
       }
-      if (users.length < FOLLOWBACK_PAGE_SIZE) break
+      const before = users.size
+      for (const row of rows) {
+        const slug = row?.username_slug || row?.slug || row?.username
+        if (typeof slug !== 'string' || !slug.trim()) throw new Error('В списке отсутствует ник; действия отменены')
+        users.set(normalizeNick(slug), { slug, aliases: [slug, row.username, row.nickname].filter(Boolean).map(normalizeNick) })
+      }
+      if (expected !== null && users.size === expected) return users
+      if (rows.length === 0) {
+        if (expected === null) return users
+        throw new Error('Получен неполный список; действия отменены')
+      }
+      if (users.size === before) throw new Error('Повтор страницы списка; действия отменены')
+      // Without a total, read through an explicit empty page rather than assuming page size.
     }
-    followingCache = { slugs, caseMap: Object.fromEntries(caseMap), total, at: Date.now() }
-    return { slugs, caseMap, total, complete: total <= FOLLOWBACK_MAX_PAGES * FOLLOWBACK_PAGE_SIZE }
+    throw new Error('Список слишком большой для безопасной проверки')
   }
 
   function escapeHtml(str: string) {
@@ -381,7 +274,7 @@
         const el = document.createElement('div')
         el.setAttribute('data-animeon-toast', '1')
         el.setAttribute('style', 'position:fixed;left:16px;bottom:16px;z-index:2147483647;width:320px;background:#141521;border:1px solid rgba(139,92,246,.45);border-left:3px solid #8b5cf6;border-radius:12px;padding:12px 14px;color:#fff;font:13px/1.45 system-ui,sans-serif;box-shadow:0 18px 50px rgba(0,0,0,.5);display:flex;gap:10px;align-items:center;cursor:pointer')
-        el.innerHTML = '<span style="flex:none;display:grid;place-items:center;width:36px;height:36px;border-radius:10px;background:rgba(139,92,246,.14);border:1px solid rgba(139,92,246,.35)"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="8" r="3.5"/><path d="M4 20c.7-3.2 3-5 6-5s5.3 1.8 6 5"/><path d="M18.5 8v6M15.5 11h6"/></svg></span><span style="min-width:0;flex:1"><span style="display:block;font-weight:600">' + escapeHtml(name) + '</span><span style="display:block;margin-top:2px;color:#d4d4d8">Подписался в ответ</span><span style="display:block;margin-top:4px;font-size:10px;color:#71717a">Animeon Desktop</span></span>'
+        el.innerHTML = '<span style="flex:none;display:grid;place-items:center;width:36px;height:36px;border-radius:10px;background:rgba(139,92,246,.14);border:1px solid rgba(139,92,246,.35)"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="8" r="3.5"/><path d="M4 20c.7-3.2 3-5 6-5s5.3 1.8 6 5"/><path d="M18.5 8v6M15.5 11h6"/></svg></span><span style="min-width:0;flex:1"><span style="display:block;font-weight:600">' + escapeHtml(name) + '</span><span style="display:block;margin-top:2px;color:#d4d4d8">Подписался в ответ</span><span style="display:block;margin-top:4px;font-size:10px;color:#71717a">AnimeOn Desktop</span></span>'
         let done = false
         const finish = () => { if (done) return; done = true; try { el.remove() } catch {} ; resolve() }
         el.addEventListener('click', finish)
@@ -451,7 +344,7 @@
       const el = document.createElement('div')
       el.setAttribute('data-animeon-anomaly', '1')
       el.setAttribute('style', 'position:fixed;left:16px;bottom:16px;z-index:2147483647;width:320px;background:#101814;border:1px solid rgba(52,211,153,.55);border-radius:12px;padding:12px 14px;color:#fff;font:13px/1.45 system-ui,sans-serif;box-shadow:0 18px 50px rgba(0,0,0,.5);display:flex;gap:10px;align-items:center;cursor:pointer;text-shadow:0 1px 2px rgba(0,0,0,.8)')
-      el.innerHTML = '<span style="flex:none;display:grid;place-items:center;width:36px;height:36px;border-radius:10px;background:rgba(52,211,153,.16);border:1px solid rgba(52,211,153,.45)"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#a7f3d0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 12 18.3 5.7"/><circle cx="12" cy="12" r="1.4" fill="#a7f3d0" stroke="none"/></svg></span><span style="min-width:0;flex:1"><span style="display:block;font-weight:700;color:#fff">Нашли аномалию!</span><span style="display:block;margin-top:2px;color:#e4e4e7">Загляни на вкладку и забери награду</span><span style="display:block;margin-top:4px;font-size:10px;color:#a1a1aa">Animeon Desktop</span></span>'
+      el.innerHTML = '<span style="flex:none;display:grid;place-items:center;width:36px;height:36px;border-radius:10px;background:rgba(52,211,153,.16);border:1px solid rgba(52,211,153,.45)"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#a7f3d0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 12 18.3 5.7"/><circle cx="12" cy="12" r="1.4" fill="#a7f3d0" stroke="none"/></svg></span><span style="min-width:0;flex:1"><span style="display:block;font-weight:700;color:#fff">Нашли аномалию!</span><span style="display:block;margin-top:2px;color:#e4e4e7">Загляни на вкладку и забери награду</span><span style="display:block;margin-top:4px;font-size:10px;color:#a1a1aa">AnimeOn Desktop</span></span>'
       const finish = () => { try { el.remove() } catch {} ; if (anomalyToastTimer) { clearTimeout(anomalyToastTimer); anomalyToastTimer = null } }
       el.addEventListener('click', finish)
       let startY = 0
@@ -498,233 +391,87 @@
     } catch {}
   }
 
-  async function claimLeadership(): Promise<boolean> {
-    const now = Date.now()
-    try {
-      const owner = await storeGet('followbackOwner')
-      if (owner && owner.id && owner.id !== INSTANCE_ID && now - (owner.ts || 0) < FOLLOWBACK_CLAIM_TTL_MS) {
-        return false
-      }
-      await storeSet('followbackOwner', { id: INSTANCE_ID, ts: now })
-      await sleep(500)
-      const check = await storeGet('followbackOwner')
-      return !!(check && check.id === INSTANCE_ID)
-    } catch { return true }
-  }
-
   let fbRunning = false
-  // force=true — редкое событие (DOM-наблюдатель только что нашёл ник после
-  // логина): пропускаем guard кадэнса, но лидерство всё равно нужно.
-  async function checkFollowBacks(force?: boolean) {
-    // Защита от параллельных прогонов в этом контексте (медленный прогон
-    // со sleep'ами не должен накладываться на следующий тик интервала).
-    if (fbRunning) return
+  let nextAttempt = 0
+  async function checkFollowBacks(force = false) {
+    if (fbRunning || (!force && Date.now() < nextAttempt)) return
     fbRunning = true
+    let claimed = false
+    let summary: any = { ts: Date.now(), followed: 0, unfollowed: 0, unfollowedNames: [] }
     try {
-      const enabled = await storeGet('followBackEnabled')
-      if (!enabled) return
-      if (!(await claimLeadership())) return
-
-      // Межвкладочный guard кадэнса (расписание теперь само-сдвигающееся,
-      // см. scheduleFollowback внизу — тики одной вкладки всегда >= CHECK_MS).
-      // Метка ставится В КОНЦЕ удачного прогона: неуспешный прогон метку не
-      // трогает, и следующая вкладка ретраит скоро, а не через 3 минуты.
-      const cadenceNow = Date.now()
-      const lastRun = Number(await storeGet('followbackLastCheck')) || 0
-      if (!force && lastRun && cadenceNow - lastRun < FOLLOWBACK_CHECK_MS - 5000) return
-
-      const ownSegment = await resolveOwnApiSegment()
-      if (!ownSegment) return
-
-      const doneByOwner = (await storeGet('followbackDoneByOwner')) || {}
-      const failByOwner = (await storeGet('followbackFailuresByOwner')) || {}
-      const doneSet = new Set<string>((doneByOwner[ownSegment] as string[]) || [])
-      const failures = (failByOwner[ownSegment] as Record<string, number>) || {}
-      // Карта «слаг → красивое имя»: following API отдаёт только строчные
-      // слаги, а display-имя (username) есть в followers API и истории.
-      const nameMap: Record<string, string> = (await storeGet('followbackNameMap')) || {}
-      try {
-        if (!Object.keys(nameMap).length) {
-          const lastFollowed: string[] = (await storeGet('followbackLastFollowed')) || []
-          for (const n of lastFollowed) { if (n) nameMap[String(n).toLowerCase()] = String(n) }
-        }
-      } catch {}
-      const now = Date.now()
-
-      const allFollowers: any[] = []
-      let total = Infinity
-      for (let page = 1; page <= FOLLOWBACK_MAX_PAGES && (page - 1) * FOLLOWBACK_PAGE_SIZE < total; page++) {
-        let resp: Response
-        try {
-          resp = await fetchWithTimeout(
-            `/api/users/${encodeURIComponent(ownSegment)}/followers?page=${page}&per_page=${FOLLOWBACK_PAGE_SIZE}`,
-            { credentials: 'include' }
-          )
-        } catch (e) {
-          console.log(FB_LOG, 'followers request failed', e)
-          break
-        }
-        if (!resp.ok) {
-          console.log(FB_LOG, 'followers request failed', resp.status)
-          if (ownSegment === 'me' || page === 1) {
-            // segment stopped working (e.g. session changed) — resolve fresh next time
-            ownSlugMemory = null
-          }
-          break
-        }
-        const data = await resp.json().catch(() => null)
-        if (!data) break
-        total = typeof data.total === 'number' ? data.total : 0
-        const users = Array.isArray(data.users) ? data.users : []
-        allFollowers.push(...users)
-        if (users.length < FOLLOWBACK_PAGE_SIZE) break
+      if (!(await storeGet('followBackEnabled'))) return
+      const owner = await resolveOwnApiSegment()
+      if (!owner) { nextAttempt = Date.now() + 15000; throw new Error('Войдите в Animeon для проверки подписок') }
+      const claim = await host()?.followbackClaim(owner, false)
+      if (!claim?.ok) { nextAttempt = Date.now() + 10000; return }
+      claimed = true
+      const followers = await readRelations(owner, 'followers')
+      const following = await readRelations(owner, 'following')
+      const matches = (user: { aliases: string[] }, list: Map<string, { aliases: string[] }>) =>
+        [...list.values()].some(other => other.aliases.some(name => user.aliases.includes(name)))
+      const protectedUser = async (user: { aliases: string[] }) => {
+        const names = (await host()?.followbackLists())?.whitelist
+        if (!Array.isArray(names)) return true
+        const whitelist = new Set((Array.isArray(names) ? names : []).map(normalizeNick))
+        return user.aliases.some(name => whitelist.has(name))
       }
-
-      const following = await fetchFollowingData(ownSegment)
-      if (!following) {
-        console.log(FB_LOG, 'following endpoint unavailable — skipping this cycle')
-        return
+      const stillAllowed = async () => {
+        if (!(await storeGet('followBackEnabled'))) return false
+        if (normalizeNick(await resolveOwnApiSegment()) !== normalizeNick(owner)) throw new Error('Аккаунт изменился; проверка остановлена')
+        return !!(await host()?.followbackClaim(owner, true))?.ok
       }
-      const followingSet = new Set(following.slugs)
-      // Полнота выборок: зеркало и анфоллоу — только по полной картине,
-      // иначе обрезанные страницы дадут ложные срабатывания.
-      const listsComplete = following.complete && total <= FOLLOWBACK_MAX_PAGES * FOLLOWBACK_PAGE_SIZE
-      // Запоминаем display-имена из свежих followers (username с регистром).
-      let mapDirty = false
-      for (const u of allFollowers) {
-        const s = u.username_slug ? String(u.username_slug).toLowerCase() : null
-        if (s && u.username && nameMap[s] !== String(u.username)) { nameMap[s] = String(u.username); mapDirty = true }
-      }
-      if (mapDirty) {
-        const keys = Object.keys(nameMap)
-        if (keys.length > 500) { for (const k of keys.slice(0, keys.length - 500)) delete nameMap[k] }
-        await storeSet('followbackNameMap', nameMap)
-      }
-
-      // Зеркало «только свои»: память приложения = пересечение с живым
-      // following. Ты отписался вручную → забываем → можно подписаться заново.
-      let pruned = 0
-      if (following.complete) {
-        for (const slug of [...doneSet]) {
-          if (!followingSet.has(slug)) { doneSet.delete(slug); delete failures[slug]; pruned++ }
-        }
-      }
-
-      // Анфоллоу: приложение подписывало, тебя уже не читают, ты ещё подписан.
-      // Ручные подписки не трогаем.
-      const unfollowedNames: string[] = []
-      if (listsComplete) {
-        const followerSlugs = new Set<string>()
-        const slugCase = new Map<string, string>()
-        for (const u of allFollowers) {
-          const orig = u.username_slug ? String(u.username_slug) : null
-          const s = orig ? orig.toLowerCase() : null
-          if (s) { followerSlugs.add(s); if (orig && !slugCase.has(s)) slugCase.set(s, orig) }
-        }
-        // Оригинальный регистр для анфоллоу чаще лежит в following-списке
-        // (цель анфоллоу по определению не во followers).
-        for (const [k, v] of following.caseMap) { if (!slugCase.has(k)) slugCase.set(k, v) }
-        const toUnfollow = [...doneSet].filter((s) => followingSet.has(s) && !followerSlugs.has(s)).slice(0, FOLLOWBACK_MAX_PER_RUN)
-        for (const slug of toUnfollow) {
-          try {
-            // Точный контракт сайта (его же JS-клиент): отписка — DELETE
-            // того же пути, что и подписка. Та же кнопка — разные методы.
-            // Слаг — в оригинальном регистре из API (как кликает сам сайт),
-            // без лишних заголовков.
-            const raw = slugCase.get(slug) || slug
-            const r = await fetchWithTimeout(`/api/users/${encodeURIComponent(raw)}/follow`, {
-              method: 'DELETE',
-              credentials: 'include',
-            })
-            if (r.ok) { unfollowedNames.push(nameMap[slug] || raw); doneSet.delete(slug); delete failures[slug] }
-            else { failures[slug] = now; diag('unfollow failed for ' + slug + ': ' + r.status) }
-          } catch { failures[slug] = now }
-          await sleep(400)
-        }
-      }
-
-      const toFollow: any[] = []
-      const skipCounts = { api: 0, already: 0, ext: 0, cooldown: 0 }
-      for (const u of allFollowers) {
-        const slug = u.username_slug ? String(u.username_slug).toLowerCase() : null
-        if (!slug) continue
-        if (u.is_following) { skipCounts.api++; continue }
-        if (followingSet.has(slug)) { skipCounts.already++; continue }
-        if (doneSet.has(slug)) { skipCounts.ext++; continue }
-        const lastFail = failures[slug]
-        if (lastFail && now - lastFail < FOLLOWBACK_RETRY_COOLDOWN_MS) { skipCounts.cooldown++; continue }
-        toFollow.push(u)
-      }
-
-      const parts: string[] = []
-      if (skipCounts.api) parts.push(skipCounts.api + ' (api flag)')
-      if (skipCounts.already) parts.push(skipCounts.already + ' (already in following)')
-      if (skipCounts.ext) parts.push(skipCounts.ext + ' (followed earlier)')
-      if (skipCounts.cooldown) parts.push(skipCounts.cooldown + ' (cooldown)')
-      // Метка + сводка + heartbeat — в конце УДАЧНОГО прогона (списки получены).
-      const runTs = Date.now()
-      await storeSet('followbackLastCheck', runTs)
-      const summary: any = { ts: runTs, segment: ownSegment, followers: allFollowers.length, skipped: skipCounts, candidates: toFollow.length, followed: 0, unfollowed: unfollowedNames.length, unfollowedNames: unfollowedNames.slice(0, 5), pruned }
-      doneByOwner[ownSegment] = [...doneSet]
-      failByOwner[ownSegment] = failures
-      await storeSet('followbackDoneByOwner', doneByOwner)
-      await storeSet('followbackFailuresByOwner', failByOwner)
-      await storeSet('followbackLastSummary', summary)
-      diag(`run seg=${ownSegment} followers=${allFollowers.length} candidates=${toFollow.length} unfollowed=${unfollowedNames.length} pruned=${pruned}` + (parts.length ? ' skipped: ' + parts.join(', ') : ''))
-      await heartbeat()
-      if (!toFollow.length) return
-
-      const batch = toFollow.slice(0, FOLLOWBACK_MAX_PER_RUN)
-      if (toFollow.length > batch.length) {
-        console.log(FB_LOG, `capping this run to ${batch.length} (of ${toFollow.length}) to avoid rate limits — rest will follow on later checks`)
-      }
-
-      const followedNames: string[] = []
-      for (const u of batch) {
-        const slug = String(u.username_slug).toLowerCase()
-        try {
-          const r = await fetchWithTimeout(`/api/users/${encodeURIComponent(u.username_slug)}/follow`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            credentials: 'include',
-          })
-          if (r.ok) {
-            followedNames.push(nameMap[slug] || u.username || u.username_slug)
-            delete failures[slug]
-            doneSet.add(slug)
-          } else {
-            failures[slug] = now
-            diag('follow failed for ' + slug + ': ' + r.status)
-          }
-        } catch {
-          failures[slug] = now
-        }
+      const removals = [...following.values()].filter(user => !matches(user, followers))
+      // Re-read followers before removal: errors or incomplete pagination abort all mutations.
+      const freshFollowers = removals.length ? await readRelations(owner, 'followers') : followers
+      for (const user of removals.filter(user => !matches(user, freshFollowers))) {
+        if (summary.unfollowed >= FOLLOWBACK_MAX_PER_RUN) break
+        if (await protectedUser(user)) continue
+        if (!(await stillAllowed())) break
+        if (await protectedUser(user)) continue
+        const response = await fetchWithTimeout(`/api/users/${encodeURIComponent(user.slug)}/follow`, { method: 'DELETE', credentials: 'include' })
+        if (!response.ok) throw new Error(`Отписка не выполнена (HTTP ${response.status}); повторим позже`)
+        summary.unfollowed++
+        summary.unfollowedNames.push(user.slug)
         await sleep(400)
       }
-
-      doneByOwner[ownSegment] = [...doneSet]
-      failByOwner[ownSegment] = failures
-      await storeSet('followbackDoneByOwner', doneByOwner)
-      await storeSet('followbackFailuresByOwner', failByOwner)
-      if (followedNames.length) {
-        const totalCount = Number((await storeGet('followbackFollowedTotal')) || 0)
-        await storeSet('followbackFollowedTotal', totalCount + followedNames.length)
-        await storeSet('followbackLastFollowed', followedNames.slice(0, 5))
-        summary.followed = followedNames.length
-        await storeSet('followbackLastSummary', summary)
-        await notifyFollowed(followedNames)
+      const followedNames: string[] = []
+      const blockedUser = async (user: { aliases: string[] }) => {
+        const names = (await host()?.followbackLists())?.blacklist
+        // Fail closed when profile-specific lists cannot be read.
+        if (!Array.isArray(names)) return true
+        const blocked = new Set(names.map(normalizeNick))
+        return user.aliases.some(name => blocked.has(name))
       }
-    } catch (e) {
-      console.log(FB_LOG, 'unexpected error', e)
+      for (const user of freshFollowers.values()) {
+        if (summary.followed >= FOLLOWBACK_MAX_PER_RUN) break
+        if (matches(user, following) || normalizeNick(user.slug) === normalizeNick(owner)) continue
+        if (await blockedUser(user)) continue
+        if (!(await stillAllowed())) break
+        if (await blockedUser(user)) continue
+        const response = await fetchWithTimeout(`/api/users/${encodeURIComponent(user.slug)}/follow`, { method: 'POST', credentials: 'include' })
+        if (!response.ok) throw new Error(`Подписка не выполнена (HTTP ${response.status}); повторим позже`)
+        summary.followed++
+        followedNames.push(user.slug)
+        await sleep(400)
+      }
+      summary.followers = freshFollowers.size
+      summary.segment = owner
+      summary.ts = Date.now()
+      summary.ok = true
+      nextAttempt = Date.now() + FOLLOWBACK_CHECK_MS
+      if (followedNames.length) await notifyFollowed(followedNames)
+    } catch (error) {
+      summary.ok = false
+      summary.error = error instanceof Error ? error.message : 'Проверка подписок не выполнена'
+      nextAttempt = Date.now() + (summary.followed || summary.unfollowed ? FOLLOWBACK_CHECK_MS : 30000)
+      diag(summary.error)
     } finally {
-      fbRunning = false
+      try { if (claimed || summary.error) await host()?.followbackFinish(summary, claimed) }
+      catch { /* The next scheduled check retries after a disconnected bridge. */ }
+      finally { fbRunning = false }
     }
   }
-
-  // Самосдвигающееся расписание: следующий тик — через CHECK_MS от старта
-  // предыдущего. Сетка не дрейфует, guard свой же тик не режет.
-  function scheduleFollowback(ms: number) {
-    setTimeout(() => { void checkFollowBacks().finally(() => scheduleFollowback(FOLLOWBACK_CHECK_MS)) }, ms)
-  }
-  scheduleFollowback(FOLLOWBACK_FIRST_DELAY_MS)
+  ;(window as any).__animeonFollowback = { wake: () => { nextAttempt = 0; void checkFollowBacks(true) } }
+  setInterval(() => { void checkFollowBacks() }, 10000)
+  setTimeout(() => { void checkFollowBacks() }, 2000)
 })()

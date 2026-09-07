@@ -5,7 +5,7 @@ const NAME_ALIASES = { 'ровно в полночь': 'полночная пр�
 const ACHIEVEMENT_DETAILS = {
   'код на память': {
     description: 'Вверх, вверх, вниз, вниз... дальше ты помнишь.',
-    steps: `1. Откройте главную страницу Animeon.
+    steps: `1. Откройте главную страницу AnimeOn.
 2. Переключите клавиатуру на английскую раскладку.
 3. Последовательно нажмите:
 ↑ ↑ ↓ ↓ ← → ← → B A
@@ -23,7 +23,7 @@ const ACHIEVEMENT_DETAILS = {
   },
   'не туда свернул': {
     description: 'Иногда самое интересное там, где ничего нет.',
-    steps: `1. Откройте любую несуществующую страницу Animeon.
+    steps: `1. Откройте любую несуществующую страницу AnimeOn.
 2. Например: https://animeon.cc/2501
 3. Дождитесь появления страницы ошибки 404.
 
@@ -50,7 +50,7 @@ const ACHIEVEMENT_DETAILS = {
 Простое обновление страницы не считается. Нужно три раза добиться полного засчитывания просмотра.`
   },
   'три часа ночи': {
-    steps: `1. Зайдите на Animeon ночью после 03:00.
+    steps: `1. Зайдите на AnimeOn ночью после 03:00.
 2. Побудьте на сайте некоторое время.
 3. Повторяйте это в течение семи дней.
 
@@ -72,7 +72,7 @@ const ACHIEVEMENT_DETAILS = {
   },
   'первая минута': {
     description: 'Аномалии не спят в полночь.',
-    steps: `1. Заранее откройте Animeon.
+    steps: `1. Заранее откройте AnimeOn.
 2. Дождитесь 00:00 по московскому времени.
 3. В первую минуту новых суток найдите появившуюся аномальную сущность.
 4. Нажмите на неё и заберите.
@@ -130,7 +130,7 @@ const ACHIEVEMENT_DETAILS = {
   },
   'свидетель патча': {
     description: 'Мир моргнул. Ты это видел.',
-    steps: `1. Находиться на Animeon в момент установки обновления сайта.
+    steps: `1. Находиться на AnimeOn в момент установки обновления сайта.
 2. Лучше держать сайт открытым или смотреть серию.
 3. После выхода обновления перезагрузить страницу.
 4. Проверить список достижений.
@@ -171,7 +171,7 @@ const ACHIEVEMENT_DETAILS = {
 Как выполнить с компьютера:
 1. Выберите любую скрытую ачивку, которую ваш аккаунт ещё не получил.
 2. До её выполнения запустите NYA Logger.
-3. Перезагрузите страницу Animeon.
+3. Перезагрузите страницу AnimeOn.
 4. Выполните выбранное скрытое достижение.
 5. Дождитесь полной анимации получения.
 6. Посмотрите найденный код в панели логгера или выгруженном файле.
@@ -279,7 +279,8 @@ export default function Secrets() {
   const [synced, setSynced] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
-  const [filter, setFilter] = useState('all')
+  const [query, setQuery] = useState('')
+  const syncGeneration = useRef(0)
   const [cursorHint, setCursorHint] = useState(null)
 
   const showCursorHint = (event, item) => {
@@ -287,6 +288,7 @@ export default function Secrets() {
     setCursorHint({ item, x: event.clientX, y: event.clientY })
   }
   const hideCursorHint = () => setCursorHint(null)
+  useEffect(() => { const close = event => { if (event.key === 'Escape') setCursorHint(null) }; window.addEventListener('keydown', close); return () => window.removeEventListener('keydown', close) }, [])
 
   const mergeCatalog = (previous, remote) => {
     const next = [...previous]
@@ -299,14 +301,17 @@ export default function Secrets() {
   }
 
   const sync = async () => {
+    const generation = ++syncGeneration.current
     setLoading(true); setError('')
+    setAchievements(null); setSynced(false)
     try {
       const result = await window.api?.achievementsFetch()
-      if (!result?.ok) { setError(result?.error || 'Нет вкладки или не выполнен вход'); return }
+      if (generation !== syncGeneration.current) return
+      if (!result?.ok) { setError(String(result?.error) === '401' ? 'Войдите в аккаунт AnimeOn для синхронизации' : 'Не удалось загрузить достижения'); return }
       setAchievements(result.data)
       const remote = [...collectRemoteSecrets(result.data)].map(([identity, item]) => {
         const code = codeOf(item), name = rawNameOf(item) || code || 'Неизвестная секретка'
-        return { key: code || identity, sourceIdentity: identity, code: code || null, name, desc: String(item?.description || item?.desc || item?.hint || 'Секретка из профиля Animeon'), received: true, completed: isCompleted(item), category: isImpossible(item) ? 'impossible' : 'standard' }
+        return { key: code || identity, sourceIdentity: identity, code: code || null, name, desc: String(item?.description || item?.desc || item?.hint || 'Секретка из профиля AnimeOn'), received: true, completed: isCompleted(item), category: isImpossible(item) ? 'impossible' : 'standard' }
       })
       setCatalog(previous => {
         const next = mergeCatalog(previous, remote)
@@ -314,7 +319,7 @@ export default function Secrets() {
         return next
       })
       setSynced(true)
-    } catch (reason) { setError(String(reason)) } finally { setLoading(false) }
+    } catch (reason) { if (generation === syncGeneration.current) setError(String(reason)) } finally { if (generation === syncGeneration.current) setLoading(false) }
   }
 
   useEffect(() => {
@@ -327,6 +332,8 @@ export default function Secrets() {
       await sync()
     }
     bootstrap()
+    const unsubscribe = window.api?.onAccountsUpdated?.(() => { setAchievements(null); setSynced(false); sync() })
+    return () => { syncGeneration.current++; unsubscribe?.() }
   }, [])
 
   const remoteEntries = useMemo(() => [...collectRemoteSecrets(achievements)].map(([identity, item]) => ({ identity, code: codeOf(item), name: nameOf(item), item })), [achievements])
@@ -336,20 +343,25 @@ export default function Secrets() {
   const stateFor = item => {
     const code = codeOf(item), name = nameOf(item)
     const remote = remoteEntries.find(entry => (code && entry.code === code) || (name && entry.name === name))
-    const done = Boolean(item.received || remote)
-    return { ...item, code, done, visibleCode: synced && done && code ? code : '······' }
+    const done = Boolean(synced && remote)
+    return { ...item, desc: remote?.item?.description || detailsFor(item)?.description || (nameOf(item) === 'три часа ночи' ? 'Семь ночей после 03:00.' : item.desc), code, done, visibleCode: synced && done && code ? code : '······' }
   }
-  const displayed = useMemo(() => standardSecrets.map(stateFor).filter(item => filter === 'all' || (filter === 'done' ? item.done : !item.done)).sort((a, b) => Number(b.done) - Number(a.done)), [standardSecrets, remoteEntries, synced, filter])
+  const displayed = standardSecrets.map(stateFor).filter(item => (item.name + ' ' + (item.code || '')).toLowerCase().includes(query.trim().toLowerCase()))
+
   const received = standardSecrets.filter(item => stateFor(item).done).length
   const percent = standardSecrets.length ? Math.round(received / standardSecrets.length * 100) : 0
 
-  return <div className="h-full overflow-auto px-6 py-6 text-white"><div className="mx-auto max-w-[920px] space-y-5">
-    <header className="grid gap-4 md:grid-cols-[1fr_auto] md:items-end"><div><div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-violet-300/80"><SparkIcon /> Коллекция открытий</div><h1 className="mt-2 text-[28px] font-semibold tracking-tight">Секреты</h1><p className="mt-1 text-sm text-zinc-400">Скрытые задания Animeon, которые уже удалось найти.</p></div><button onClick={sync} disabled={loading} className="h-10 rounded-xl bg-white px-4 text-sm font-medium text-black transition hover:bg-zinc-200 disabled:opacity-50">{loading ? 'Синхронизация...' : 'Синхронизировать'}</button></header>
-    {error && <div className="rounded-xl border border-red-400/20 bg-red-400/10 p-3 text-xs text-red-300">{error}. Откройте Animeon и войдите в аккаунт.</div>}
-    <section className="grid gap-4 rounded-2xl border border-white/10 bg-[#141521] p-5 sm:grid-cols-[1fr_170px] sm:items-center"><div><div className="flex items-center gap-2 text-xs text-zinc-400"><LockIcon /> Прогресс коллекции</div><div className="mt-2 flex items-end gap-3"><span className="text-4xl font-semibold tracking-tight">{received}</span><span className="pb-1 text-sm text-zinc-500">из {standardSecrets.length} секретов</span></div><div role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={percent} className="mt-4 h-2.5 overflow-hidden rounded-full bg-[#292a38]"><div className="h-full rounded-full bg-violet-400 shadow-[0_0_12px_rgba(167,139,250,.65)] transition-[width] duration-500" style={{ width: `${percent}%` }} /></div></div><div className="text-left sm:text-right"><div className="text-3xl font-semibold text-violet-200">{percent}%</div><div className="mt-1 text-xs text-zinc-500">{synced ? 'синхронизировано' : 'ожидает входа'}</div></div></section>
-    <div className="flex flex-wrap items-center gap-2"><span className="mr-2 text-xs text-zinc-500">Показывать:</span>{[['all', 'Все'], ['done', 'Полученные'], ['open', 'Не полученные'], ['impossible', 'Невозможные']].map(([id, label]) => <button key={id} onClick={() => setFilter(id)} className={`rounded-lg border px-3 py-2 text-xs transition ${filter === id ? (id === 'impossible' ? 'border-amber-200/45 bg-amber-100/[0.08] text-amber-100' : 'border-violet-400/50 bg-violet-500/15 text-violet-200') : 'border-white/10 bg-white/[0.03] text-zinc-400 hover:text-white'}`}>{label}</button>)}</div>
-    {filter === 'impossible' ? <section className="space-y-3">{impossibleSecrets.map(item => <ImpossibleCard key={item.key} item={item} />)}</section> : <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{displayed.map((item, index) => <article key={item.key || item.code} className={`relative rounded-xl border p-4 transition ${item.done ? 'border-emerald-400/20 bg-emerald-400/[0.06]' : 'border-white/10 bg-[#11121b] hover:border-violet-400/30'}`}><div className="flex items-start justify-between gap-3"><div className={`grid h-9 w-9 place-items-center rounded-lg ${item.done ? 'bg-emerald-400/15 text-emerald-300' : 'bg-white/[0.06] text-zinc-500'}`}>{item.done ? '✓' : <LockIcon />}</div><div className="flex items-center gap-2"><span className="font-mono text-[10px] text-zinc-600">#{String(index + 1).padStart(2, '0')}</span>{detailsFor(item) && <span title="Наведите на ? для инструкции" onMouseEnter={event => showCursorHint(event, item)} onMouseLeave={hideCursorHint} className="grid h-5 w-5 cursor-help place-items-center rounded-full border border-violet-300/35 text-[11px] font-medium text-violet-200/80 transition hover:border-violet-200 hover:bg-violet-300/10 hover:text-violet-100">?</span>}</div></div><h2 className="mt-4 text-sm font-medium text-white">{item.name}</h2><p className="mt-1 min-h-[34px] text-xs leading-relaxed text-zinc-400">{item.desc}</p><div className="mt-4 flex items-center justify-between border-t border-white/[0.07] pt-3"><code className="text-[10px] text-zinc-500">{item.visibleCode}</code><span className={`text-[10px] font-medium ${item.done ? 'text-emerald-300' : 'text-zinc-500'}`}>{item.done ? 'получено' : 'не открыто'}</span></div></article>)}</section>}
-    <CursorHint hint={cursorHint} />
-    {synced && <p className="text-xs text-zinc-500">Данные получены из текущей сессии Animeon.</p>}
-  </div></div>
+  const selectedDetails = cursorHint ? detailsFor(cursorHint.item) : null
+  const section = (title, items) => items.length > 0 && <section className="signal-secret-group"><div className="signal-kicker">{title} · {items.length}</div>{items.map(item => <article key={item.key} className={'signal-secret-row' + (item.done ? ' done' : '')}><span className="signal-secret-number">{String(standardSecrets.findIndex(secret => secret.key === item.key) + 1).padStart(2, '0')}</span><div className="signal-secret-copy"><h2>{item.name}</h2><p>{item.desc}</p></div><small>{item.done ? 'получено' : synced ? 'не открыто' : 'не проверено'}</small>{detailsFor(item) && <button className="signal-hint" aria-label={'Инструкция: ' + item.name} onClick={event => showCursorHint(event, item)}>?</button>}</article>)}</section>
+  return <div className="signal-page">
+    <div className="signal-kicker">КОЛЛЕКЦИЯ · {synced ? received : '—'}/{standardSecrets.length} · {synced ? percent + '%' : 'не синхронизировано'}</div>
+    <h1>Секреты</h1><p className="signal-lede">Скрытые задания AnimeOn. Нажми на ? — покажем, как выполнить.</p>
+    <div className="signal-search"><input value={query} onChange={event => setQuery(event.target.value)} placeholder="Найти секрет…" aria-label="Найти секрет" /><button className="signal-primary" onClick={sync} disabled={loading}>{loading ? 'Загрузка…' : 'Синхронизировать'}</button></div>
+    {error && <p role="alert" className="signal-note">{error}. Проверьте вкладку AnimeOn и вход в аккаунт.</p>}
+    {!query.trim() && impossibleSecrets.map(item => <article key={item.key} className="signal-impossible"><span className="serial" aria-hidden="true">001</span><small>ЕДИНСТВЕННАЯ В МИРЕ · ВНЕ КОЛЛЕКЦИИ</small><h2>{item.name}</h2><p>{item.desc}</p><footer><span>Владелец: <button onClick={() => window.api?.tabsCreate?.('https://v2.animeon.co/user/' + item.holder)}>{item.holder}</button></span><span>недостижима</span></footer></article>)}
+    {section(synced ? 'ОСТАЛОСЬ ПОЛУЧИТЬ' : 'КОЛЛЕКЦИЯ', displayed.filter(item => !item.done))}
+    {section('ПОЛУЧЕНО', displayed.filter(item => item.done))}
+    {!displayed.length && <div className="signal-empty"><b>Ничего не найдено</b><p>Попробуй другое название или очисти поиск.</p><button onClick={() => setQuery('')}>Очистить поиск</button></div>}
+    {cursorHint && selectedDetails && <div className="signal-overlay" onClick={hideCursorHint}><aside className="signal-instruction" role="dialog" aria-modal="true" aria-labelledby="instruction-title" onClick={event => event.stopPropagation()}><button className="signal-close" aria-label="Закрыть инструкцию" onClick={hideCursorHint}>×</button><small className="signal-kicker">КАК ВЫПОЛНИТЬ</small><h2 id="instruction-title">{cursorHint.item.name}</h2><p>{selectedDetails.description}</p><div className="signal-instruction-steps">{selectedDetails.steps}</div><button autoFocus className="signal-primary" onClick={hideCursorHint}>Понятно</button></aside></div>}
+  </div>
 }

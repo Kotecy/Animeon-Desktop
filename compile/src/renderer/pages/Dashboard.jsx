@@ -1,4 +1,6 @@
-import { useEffect, useState } from 'react'
+import { AUTO_COLLECT_AVAILABLE } from '../../shared/buildFlags'
+import { useEffect, useRef, useState } from 'react'
+import { moscowTime } from '../components/MoscowClock'
 import anomalySoundUrl from '../assets/AnomalyDetected.mp3?inline'
 
 const RadarIcon = ({ size = 20 }) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5" /><path d="M12 12 18.3 5.7" /><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none" /><path d="M12 3.5v1M3.5 12h1M19.5 12h1M12 19.5v1" /></svg>
@@ -7,69 +9,179 @@ const SparkIcon = ({ size = 18 }) => <svg width={size} height={size} viewBox="0 
 const CodeIcon = ({ size = 18 }) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m8 9-3 3 3 3M16 9l3 3-3 3M14 5l-4 14" /></svg>
 const TerminalIcon = ({ size = 18 }) => <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="m7 9 3 3-3 3M13 15h4" /></svg>
 
-function Toggle({ checked, onClick, label, disabled = false, accent = 'bg-violet-500' }) {
-  return <button role="switch" aria-checked={checked} aria-label={label} disabled={disabled} onClick={(event) => { event.stopPropagation(); onClick(event) }} className={`relative h-6 w-11 shrink-0 rounded-full outline-none transition focus-visible:ring-2 focus-visible:ring-violet-300/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#11121b] disabled:cursor-wait disabled:opacity-60 ${checked ? accent : 'bg-white/10'}`}><span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition ${checked ? 'left-5' : 'left-0.5'}`} /></button>
+function Toggle({ checked, onClick, label, disabled = false }) {
+  return <button type="button" role="switch" aria-checked={checked} aria-label={label} disabled={disabled} onClick={(event) => { event.stopPropagation(); onClick(event) }} className="signal-switch signal-function-switch"><i aria-hidden="true" /></button>
 }
 
-function UtilityCard({ icon, title, description, active, busy, onToggle, accent, note, children }) {
-  const theme = accent === 'cyan' ? 'border-cyan-400/20 bg-cyan-400/[0.06] text-cyan-200' : accent === 'amber' ? 'border-amber-400/20 bg-amber-400/[0.06] text-amber-200' : 'border-violet-400/20 bg-violet-400/[0.06] text-violet-200'
-  return <section className="flex min-h-[198px] flex-col rounded-2xl border border-white/10 bg-[#11121b] p-5 transition hover:border-white/20"><div className="flex items-start justify-between gap-4"><div className="flex min-w-0 items-start gap-3"><div className={`grid h-10 w-10 shrink-0 place-items-center rounded-xl border ${theme}`}>{icon}</div><div><h2 className="text-sm font-semibold text-white">{title}</h2><p className="mt-1 text-xs leading-relaxed text-zinc-500">{description}</p></div></div>{onToggle && <Toggle checked={active} onClick={onToggle} label={`Переключить ${title}`} disabled={busy} accent={accent === 'cyan' ? 'bg-cyan-500' : 'bg-violet-500'} />}</div><div className="mt-auto pt-5"><div className={`flex items-center gap-2 text-[11px] ${active ? 'text-emerald-300' : 'text-zinc-500'}`}><span className={`h-1.5 w-1.5 rounded-full ${active ? 'bg-emerald-300 shadow-[0_0_10px_rgba(110,231,183,.85)]' : 'bg-zinc-600'}`} />{busy ? 'Запускается…' : active ? 'Активен' : 'Выключен'}</div>{note && <div className="mt-2 text-[11px] leading-relaxed text-zinc-500">{note}</div>}{children}</div></section>
+function UtilityCard({ icon, title, description, active, busy, onToggle, note, children }) {
+  return <section className="signal-card signal-tool"><div className="signal-face">{icon}</div><h2>{title}</h2><p className="signal-note">{description}</p><div className="signal-tool-footer">{onToggle ? <><small>{busy ? 'Загрузка…' : active ? 'включён' : 'выкл'}</small><Toggle checked={active} onClick={onToggle} label={'Переключить ' + title} disabled={busy} /></> : children}</div>{note && <p role="status" className="signal-note">{note}</p>}</section>
 }
 
 export default function Dashboard({ events = [], pushEvent = () => {}, fbCheck = 0 }) {
-  const [watching, setWatching] = useState(false)
+  const [authorized, setAuthorized] = useState(null)
+  useEffect(() => {
+    let alive = true, revision = 0
+    const refresh = async (reset = false) => {
+      const current = ++revision
+      if (reset) setAuthorized(null)
+      try {
+        const state = await window.api?.authState?.()
+        if (alive && current === revision) setAuthorized(state?.authenticated === true)
+      } catch { if (alive && current === revision) setAuthorized(false) }
+    }
+    const auth = window.api?.onAuthUpdated?.(state => { revision++; if (alive) setAuthorized(state?.authenticated === true) })
+    const account = window.api?.onAccountsUpdated?.(() => refresh(true))
+    const tabs = window.api?.onTabsUpdated?.(() => refresh())
+    refresh()
+    const timer = setInterval(() => refresh(), 15000)
+    return () => { alive = false; revision++; clearInterval(timer); auth?.(); account?.(); tabs?.() }
+  }, [])
+  const authHint = authorized === null ? 'Проверяем авторизацию…' : !authorized ? 'Войдите в аккаунт' : ''
+  const [remaining, setRemaining] = useState(null)
+  const [remainingError, setRemainingError] = useState('')
+  useEffect(() => {
+    let alive = true, generation = 0
+    const refresh = async () => {
+      const current = ++generation
+      setRemaining(null); setRemainingError('Загрузка…')
+      try {
+        const result = await window.api?.anomalyState?.()
+        if (!alive || current !== generation) return
+        setRemaining(result?.ok ? result.remaining : null); setRemainingError(result?.ok ? '' : result?.error || 'Данные недоступны')
+      } catch { if (alive && current === generation) setRemainingError('Не удалось загрузить остаток') }
+    }
+    refresh()
+    const subscriptions = [window.api?.onAnomalyDetected?.(refresh), window.api?.onAnomalyCollected?.(refresh), window.api?.onAccountsUpdated?.(refresh)]
+    const timer = setInterval(refresh, 60000)
+    return () => { alive = false; clearInterval(timer); subscriptions.forEach(unsubscribe => unsubscribe?.()) }
+  }, [])
+  const [watching, setWatching] = useState(null)
   const [sound, setSound] = useState(true)
+  const [autoCollect, setAutoCollect] = useState(false)
   const [toastOn, setToastOn] = useState(true)
   const [detCount, setDetCount] = useState(0)
   const [detLastAt, setDetLastAt] = useState(0)
-  const [follow, setFollow] = useState(false)
+  const [follow, setFollow] = useState(null)
+  const [followBusy, setFollowBusy] = useState(false)
+  const [followError, setFollowError] = useState('')
+  const [nextCheck, setNextCheck] = useState(0)
+  const [whitelist, setWhitelist] = useState([])
+  const [blacklist, setBlacklist] = useState([])
+  const [blockedNickname, setBlockedNickname] = useState('')
+  const [listEditor, setListEditor] = useState(null)
+  const listDialog = useRef(null)
+  useEffect(() => {
+    const dialog = listDialog.current
+    if (listEditor) { if (!dialog.open) dialog.showModal() }
+    else if (dialog.open) dialog.close()
+  }, [listEditor])
+  const [listProfile, setListProfile] = useState('')
+  const listProfileRef = useRef('')
+  const [nickname, setNickname] = useState('')
+  const followGeneration = useRef(0)
   const [fbCheckState, setFbCheckState] = useState(0)
   const [tabsCount, setTabsCount] = useState(0)
   const [nowTs, setNowTs] = useState(Date.now())
-  const [utilities, setUtilities] = useState([])
+  const [utilities, setUtilities] = useState(null)
+  const utilityGeneration = useRef(0)
+  const detectorGeneration = useRef(0)
   const [utilityBusy, setUtilityBusy] = useState('')
-  const [morseBusy, setMorseBusy] = useState(false)
-  const [morseResult, setMorseResult] = useState('')
   const [toolsOpen, setToolsOpen] = useState(false)
 
   useEffect(() => { const t = setInterval(() => setNowTs(Date.now()), 1000); return () => clearInterval(t) }, [])
-  const lastCheckTs = fbCheck || fbCheckState
-  const remainMs = lastCheckTs ? lastCheckTs + 180000 - nowTs : null
+  const lastCheckTs = fbCheckState
+  const remainMs = nextCheck ? nextCheck - nowTs : null
   const remainText = remainMs == null ? '—' : remainMs > 0 ? `${String(Math.floor(remainMs / 60000)).padStart(2, '0')}:${String(Math.floor(remainMs % 60000 / 1000)).padStart(2, '0')}` : 'проверка идёт…'
-  const utilityActive = (id) => utilities.some(item => item.id === id)
+  const utilityActive = (id) => (utilities || []).some(item => item.id === id)
 
-  const refreshFollowStatus = async () => { try { const s = await window.api?.storeGetAll(); if (s) { setFollow(!!s.followBackEnabled); setFbCheckState(Number(s.followbackLastCheck) || 0) } } catch {} }
-  const refreshUtilities = async () => { try { const items = await window.api?.utilitiesList?.(); if (Array.isArray(items)) setUtilities(items) } catch {} }
-  useEffect(() => { refreshFollowStatus(); const t = setInterval(refreshFollowStatus, 30000); return () => clearInterval(t) }, [])
+  const refreshFollowStatus = async () => {
+    const generation = ++followGeneration.current
+    try {
+      const s = await window.api?.followbackState?.()
+      if (!s || generation !== followGeneration.current) return
+      setFollow(!!s.enabled); setFbCheckState(Number(s.lastCheck) || 0); setNextCheck(Number(s.nextAt) || 0)
+      setFollowError(s.error || ''); setWhitelist(Array.isArray(s.whitelist) ? s.whitelist : [])
+      if (listProfileRef.current !== s.profileId) { setNickname(''); setBlockedNickname(''); setListEditor(null) }
+      listProfileRef.current = s.profileId
+      setListProfile(s.profileId)
+      setBlacklist(Array.isArray(s.blacklist) ? s.blacklist : [])
+    } catch { if (generation === followGeneration.current) setFollowError('Не удалось прочитать состояние') }
+  }
+  const saveWhitelist = async names => {
+    setFollowBusy(true)
+    try { const saved = await window.api.followbackWhitelist(names, listProfile); if (listProfileRef.current === listProfile) { setWhitelist(saved); setNickname('') } }
+    catch { setFollowError('Не удалось сохранить белый список') }
+    finally { setFollowBusy(false) }
+  }
+  const refreshUtilities = async () => { const generation = ++utilityGeneration.current; try { const items = await window.api?.utilitiesList?.(); if (generation === utilityGeneration.current && Array.isArray(items)) setUtilities(items) } catch {} }
+  const saveBlacklist = async names => {
+    setFollowBusy(true)
+    try { const saved = await window.api.followbackBlacklist(names, listProfile); if (listProfileRef.current === listProfile) { setBlacklist(saved); setBlockedNickname('') } }
+    catch { setFollowError('Не удалось сохранить чёрный список: проверьте выбранный профиль') }
+    finally { setFollowBusy(false) }
+  }
+  useEffect(() => {
+    refreshFollowStatus()
+    const t = setInterval(refreshFollowStatus, 5000)
+    const unsub = window.api?.onFollowbackState?.(refreshFollowStatus)
+    const account = window.api?.onAccountsUpdated?.(refreshFollowStatus)
+    return () => { followGeneration.current++; clearInterval(t); unsub?.(); account?.() }
+  }, [])
   useEffect(() => {
     refreshUtilities()
-    const unsubscribe = window.api?.onUtilitiesUpdated?.(setUtilities)
-    return () => { if (typeof unsubscribe === 'function') unsubscribe() }
+    const unsubscribe = window.api?.onUtilitiesUpdated?.(items => { utilityGeneration.current++; setUtilities(items) })
+    return () => { utilityGeneration.current++; if (typeof unsubscribe === 'function') unsubscribe() }
   }, [])
-  useEffect(() => { if (utilities.some(item => item.id === 'nya-logger' || item.id === 'xp-checker')) setToolsOpen(true) }, [utilities])
-  const refreshDetector = async () => { try { const s = await window.api?.storeGetAll(); const d = s?.detector || {}; setWatching(!!d.watching); setSound(d.sound !== false); setToastOn(d.toast !== false); setDetCount(Number(d.count) || 0); setDetLastAt(Number(d.lastAt) || 0); setFollow(!!s.followBackEnabled); setTabsCount((s.tabs || []).length) } catch {} }
+  const refreshDetector = async () => { const generation = ++detectorGeneration.current; try { const s = await window.api?.storeGetAll(); if (generation !== detectorGeneration.current) return; const d = s?.detector || {}; setAutoCollect(!!d.autoCollect); setWatching(!!d.watching); setSound(d.sound !== false); setToastOn(d.toast !== false); setDetCount(Number(d.count) || 0); setDetLastAt(Number(d.lastAt) || 0); setTabsCount((s.tabs || []).length) } catch {} }
   useEffect(() => {
     refreshDetector()
-    const unsubscribeDetector = window.api?.onDetectorUpdated?.(d => { if (d) { setWatching(!!d.watching); setSound(d.sound !== false); setToastOn(d.toast !== false); setDetCount(Number(d.count) || 0); setDetLastAt(Number(d.lastAt) || 0) } })
+    const unsubscribeDetector = window.api?.onDetectorUpdated?.(d => { if (d) { detectorGeneration.current++; setAutoCollect(!!d.autoCollect); setWatching(!!d.watching); setSound(d.sound !== false); setToastOn(d.toast !== false); setDetCount(Number(d.count) || 0); setDetLastAt(Number(d.lastAt) || 0) } })
     const unsubscribeTabs = window.api?.onTabsUpdated?.(t => setTabsCount(Array.isArray(t) ? t.length : 0))
     return () => {
-      if (typeof unsubscribeDetector === 'function') unsubscribeDetector()
+      detectorGeneration.current++; if (typeof unsubscribeDetector === 'function') unsubscribeDetector()
       if (typeof unsubscribeTabs === 'function') unsubscribeTabs()
     }
   }, [])
 
-  const toggleWatch = async () => { const d = await window.api?.detectorToggle(); if (d) { setWatching(!!d.watching); setDetCount(Number(d.count) || 0); setDetLastAt(Number(d.lastAt) || 0); pushEvent(d.watching ? 'Наблюдение включено' : 'Наблюдение выключено') } }
+  const toggleWatch = async () => { const d = await window.api?.detectorToggle(); if (d?.error) { pushEvent(d.error); return } if (d) { setWatching(!!d.watching); setDetCount(Number(d.count) || 0); setDetLastAt(Number(d.lastAt) || 0); pushEvent(d.watching ? 'Наблюдение включено' : 'Наблюдение выключено') } }
   const toggleSound = async () => { const d = await window.api?.detectorSound(); if (d) setSound(d.sound !== false) }
   const toggleToast = async () => { const d = await window.api?.detectorToast(); if (d) setToastOn(d.toast !== false) }
-  const testSound = async () => { try { const a = new Audio(anomalySoundUrl); a.volume = 1; await a.play() } catch { pushEvent('Звук заблокирован — кликни по окну один раз') } }
+  const testSound = async () => { try { const a = new Audio(anomalySoundUrl); a.volume = 0.1; await a.play() } catch { pushEvent('Звук заблокирован — кликни по окну один раз') } }
   const toggleUtility = async (id, title) => { setUtilityBusy(id); try { const result = await window.api?.utilitiesToggle?.(id); if (!result?.ok) pushEvent(`${title}: ${result?.error || 'не удалось изменить состояние'}`); else pushEvent(`${title}: ${result.active ? 'включён' : 'выключен'}`); await refreshUtilities() } catch { pushEvent(`${title}: не удалось изменить состояние`) } setUtilityBusy('') }
-  const runMorse = async () => { setMorseBusy(true); setMorseResult(''); try { const result = await window.api?.utilitiesRunMorse?.(); if (!result?.ok) { setMorseResult(result?.error || 'Не удалось расшифровать'); pushEvent('Декодер Морзе: ошибка') } else { setMorseResult(result.decoded || 'Код не распознан'); pushEvent('Декодер Морзе: готово') } } catch { setMorseResult('Не удалось расшифровать'); pushEvent('Декодер Морзе: ошибка') } setMorseBusy(false) }
 
-  return <div className="h-full overflow-auto px-6 py-6 text-white"><div className="mx-auto max-w-[920px] space-y-5">
-    <header className="grid gap-4 md:grid-cols-[1fr_220px] md:items-end"><div><div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-violet-300/80"><RadarIcon size={14} /> Наблюдение</div><h1 className="mt-2 text-[28px] font-semibold tracking-tight">Детектор аномалий</h1><p className="mt-1 text-sm text-zinc-400">Следит за открытыми вкладками Animeon и сообщает о находках.</p></div><div className="relative h-24 overflow-hidden rounded-xl border border-white/10 bg-[#10111a] p-2"><svg viewBox="0 0 220 88" preserveAspectRatio="xMidYMid meet" className="h-full w-full text-violet-300/80" fill="none" aria-hidden="true"><circle cx="166" cy="44" r="29" stroke="currentColor" strokeOpacity=".22"/><circle cx="166" cy="44" r="18" stroke="currentColor" strokeOpacity=".45"/><circle cx="166" cy="44" r="5" fill="currentColor" fillOpacity=".85" stroke="none"/><path d="M166 44 202 18" stroke="currentColor" strokeOpacity=".7"/><path d="M28 68h78" stroke="#34d399" strokeOpacity=".45"/><path d="M28 58h48" stroke="currentColor" strokeOpacity=".35"/><circle cx="202" cy="18" r="3" fill="#34d399" stroke="none"/></svg><div className="absolute bottom-2 left-3 text-[10px] text-zinc-500">Следит во всех вкладках</div></div></header>
-    <section className="relative overflow-hidden rounded-2xl border border-white/10 bg-[#141521] p-5 shadow-[0_18px_50px_rgba(0,0,0,.25)]"><div className="absolute -right-16 -top-20 h-56 w-56 rounded-full bg-emerald-500/10 blur-3xl" /><div className="relative grid gap-6 lg:grid-cols-[1fr_260px] lg:items-center"><div><div className="flex items-center gap-3"><div className={`grid h-12 w-12 place-items-center rounded-xl border ${watching ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-300' : 'border-white/10 bg-white/[0.04] text-zinc-400'}`}><RadarIcon size={22} /></div><div><div className={`text-sm font-medium ${watching ? 'text-emerald-300' : 'text-zinc-300'}`}>{watching ? 'Наблюдаю' : 'Выключен'}</div><div className="text-xs text-zinc-500">{watching ? 'Позову звуком и тостом, награду заберёшь сам' : 'Включи, когда откроешь Animeon'}</div></div></div><div className="mt-6 flex flex-wrap items-end gap-x-10 gap-y-4"><div><div className="text-4xl font-semibold tracking-tight">{detCount}</div><div className="mt-1 text-xs text-zinc-500">замечено всего</div></div><div><div className="text-2xl font-semibold text-emerald-300">{detLastAt ? new Date(detLastAt).toLocaleTimeString() : '—'}</div><div className="mt-1 text-xs text-zinc-500">последняя находка</div></div></div></div><div className="flex flex-col gap-2"><button onClick={toggleWatch} className={`flex h-12 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold transition ${watching ? 'border border-white/15 bg-white text-black hover:bg-zinc-200' : 'bg-emerald-500 text-white shadow-[0_10px_30px_rgba(52,211,153,.28)] hover:bg-emerald-400'}`}><BellIcon size={17} /> {watching ? 'Выключить' : 'Включить наблюдение'}</button><div className="flex gap-2"><button onClick={toggleSound} className={`flex h-10 flex-1 items-center justify-center gap-2 rounded-xl border px-3 text-xs transition ${sound ? 'border-emerald-400/40 bg-emerald-500/15 text-emerald-200' : 'border-white/10 bg-white/[0.03] text-zinc-400 hover:text-white'}`}>Звук: {sound ? 'вкл' : 'выкл'}</button><button onClick={testSound} className="flex h-10 flex-1 items-center justify-center rounded-xl border border-white/10 bg-white/[0.03] px-3 text-xs text-zinc-400 transition hover:text-white">Проверить звук</button></div><button onClick={toggleToast} className="mt-2 flex w-full items-center justify-between gap-3 rounded-xl border border-white/10 bg-white/[0.03] px-3.5 py-2.5 text-left transition hover:border-white/20"><span><span className="block text-xs font-medium text-zinc-200">Всплывающее уведомление</span><span className="mt-0.5 block text-[11px] text-zinc-500">Показывать окно поверх сайта при находке</span></span><Toggle checked={toastOn} onClick={toggleToast} label="Переключить всплывающее уведомление" accent="bg-emerald-500" /></button></div></div></section>
-    <section className="grid gap-5 lg:grid-cols-[1.35fr_.85fr]"><div className="rounded-2xl border border-white/10 bg-[#11121b] p-5"><div className="flex items-start justify-between gap-4"><div><h2 className="text-sm font-medium">Вкладки</h2><p className="mt-1 text-xs leading-relaxed text-zinc-500">Детектор проверяет все открытые вкладки сайта. Фоновая проверка продолжается после сворачивания приложения.</p></div><div className="rounded-lg bg-violet-500/15 px-2.5 py-1.5 text-sm font-semibold text-violet-200">{tabsCount}</div></div></div><div className="rounded-2xl border border-white/10 bg-[#11121b] p-5"><div className="flex items-start justify-between gap-4"><div><h2 className="text-sm font-medium">Автоподписка</h2><p className="mt-1 text-xs leading-relaxed text-zinc-500">Подписываться в ответ на новых фолловеров.</p></div><Toggle checked={follow} onClick={async () => { setFollow(!!(await window.api?.followbackToggle())); refreshFollowStatus() }} label="Переключить автоподписку" /></div>{follow && <div className="mt-3 text-[11px] text-zinc-500">Последняя проверка: {lastCheckTs ? new Date(lastCheckTs).toLocaleTimeString() : 'ещё не было'}</div>}{follow && <div className="mt-1.5 text-[11px] text-zinc-500">Следующая проверка через: {remainText}</div>}</div></section>
-    <section className="grid gap-5 lg:grid-cols-[1.35fr_.85fr]"><div className="rounded-2xl border border-white/10 bg-[#11121b] p-5"><h2 className="text-sm font-medium">Последние действия</h2><div className="mt-4 h-[152px] space-y-3 overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">{events.length ? events.map(event => <div key={event.id} className="flex items-center justify-between border-b border-white/[0.06] pb-3 text-xs"><span className="text-zinc-300">{event.text}</span><span className="text-zinc-600">{event.time}</span></div>) : <div className="rounded-xl border border-dashed border-white/10 px-4 py-5 text-xs text-zinc-500">Здесь появится журнал работы после запуска.</div>}</div></div><div className="flex flex-col rounded-2xl border border-emerald-400/15 bg-emerald-500/[0.07] p-5"><div className="text-xs font-medium uppercase tracking-[0.14em] text-emerald-200/80">Как это работает</div><p className="mt-3 break-words text-sm leading-relaxed text-zinc-300">Нашли аномалию — позовём звуком и окном. Награду забираешь сам, страницу не трогаем.</p><div className="mt-auto flex items-center gap-2 pt-4 text-xs text-emerald-200"><span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-300" /> Все вкладки под наблюдением</div></div></section>
-    <section className={`overflow-hidden rounded-2xl border bg-[#11121b] transition-colors ${toolsOpen ? 'border-violet-400/25' : 'border-white/10'}`}><button aria-expanded={toolsOpen} onClick={() => setToolsOpen(open => !open)} className="w-full px-5 py-4 text-left transition hover:bg-white/[0.03]"><div className="text-[11px] uppercase tracking-[0.18em] text-violet-300/80">Инструменты</div><h2 className="mt-1 text-sm font-semibold">Дополнительные функции</h2></button>{toolsOpen && <div className="border-t border-white/[0.08] p-5"><p className="mb-4 text-xs text-zinc-500">Переключатель включает инструмент во всех вкладках Animeon, включая новые.</p><div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3"><UtilityCard icon={<SparkIcon />} title="NyaLogger" description="Ищет секретные коды NYA в событиях, сети и интерфейсе сайта." active={utilityActive('nya-logger')} busy={utilityBusy === 'nya-logger'} onToggle={() => toggleUtility('nya-logger', 'NyaLogger')} accent="cyan" note="Работает во всех вкладках Animeon и останавливается одним переключателем." /><UtilityCard icon={<CodeIcon />} title="XP Monitor" description="Следит за XP профиля каждой вкладки и отмечает круглые значения." active={utilityActive('xp-checker')} busy={utilityBusy === 'xp-checker'} onToggle={() => toggleUtility('xp-checker', 'XP Monitor')} accent="cyan" note="Работает во всех вкладках; ник берётся из их авторизованных сессий." /><UtilityCard icon={<TerminalIcon />} title="Декодер Морзе" description="Запрашивает последовательность из терминального задания и расшифровывает её." active={false} busy={morseBusy} accent="amber" note={morseResult ? `Расшифровка: ${morseResult}` : 'Работает по нажатию и не остаётся в фоне.'}><button disabled={morseBusy} onClick={runMorse} className="mt-3 h-9 w-full rounded-lg border border-amber-300/25 bg-amber-400/10 px-3 text-xs font-medium text-amber-100 transition hover:bg-amber-400/20 disabled:cursor-wait disabled:opacity-60">{morseBusy ? 'Расшифровка…' : 'Расшифровать'}</button></UtilityCard></div></div>}</section>
-  </div></div>
+  return <div className="signal-page">
+    <h1>Детектор <em>аномалий</em></h1><p className="signal-lede">Удобные функции для AnimeOn</p>
+    <div className="signal-dashboard">
+      <div className="signal-column signal-left-column"><section className="signal-card signal-stat-card"><small className="signal-kicker">СТАТУС</small>
+        <div className="signal-stats"><div><strong>{String(detCount).padStart(2, '0')}</strong><small>замечено всего</small></div><div><b>{detLastAt ? moscowTime(detLastAt) : '—'}</b><small>последняя находка</small></div><div title={remainingError}><b>{remaining ?? '—'}</b><small>аномалий осталось сегодня</small></div></div>
+        <div className="signal-journal">{events.length ? events.map(event => <div key={event.id} title={`${event.time} — ${event.text}`}>{event.time} — {event.text}</div>) : <p>Здесь появится журнал работы после запуска.</p>}</div>
+        <p role="status" className="signal-note" title={remainingError}>{remainingError || '\u00a0'}</p>
+      </section>
+      <UtilityCard icon={<CodeIcon />} title="XP Монитор" description="Показывает текущий XP и его изменение." active={utilityActive('xp-checker')} busy={utilities === null || utilityBusy === 'xp-checker'} onToggle={() => toggleUtility('xp-checker', 'XP Монитор')} />
+      </div>
+      <div className="signal-column"><section className={"signal-card" + (!authorized ? " signal-auth-disabled" : "")} title={authHint || undefined}><b>{watching ? 'Наблюдаю' : 'Выключен'}</b><div className="signal-detector-actions"><button className="signal-primary" disabled={!authorized || watching === null} onClick={toggleWatch}>{watching ? 'Выключить' : 'Включить'}</button><button disabled={!authorized} aria-pressed={sound} onClick={toggleSound} className={'signal-sound' + (sound ? ' on' : '')}>Звук: {sound ? 'вкл' : 'выкл'}</button></div>{AUTO_COLLECT_AVAILABLE && <div className={'signal-setting-row signal-autocollect' + (!authorized || !watching ? ' disabled' : '')} title={authHint || (!watching ? 'Сначала включите детектор' : undefined)}><div><b>Автоматический сбор</b></div>{watching === null ? <span className="signal-switch-placeholder" /> : <button disabled={!authorized || !watching} className="signal-switch" role="switch" aria-label="Автоматический сбор" aria-checked={autoCollect} onClick={() => window.api?.detectorCollect()}><i /></button>}</div>}{authHint && <p className="signal-note signal-auth-hint" role="status">{authHint}</p>}</section>
+        <section className={"signal-card" + (!authorized ? " signal-auth-disabled" : "")} title={authHint || undefined}><div className="signal-heading"><div><h2>Автоподписка</h2><div className="signal-follow-meta"><span>проверка: {lastCheckTs ? moscowTime(lastCheckTs) : '—'}</span><span>следующая: {follow ? remainText : '—'}</span></div></div>{follow === null ? <span className="signal-switch-placeholder" aria-label="Загрузка состояния" /> : <Toggle checked={follow} disabled={!authorized || followBusy} onClick={async () => { setFollowBusy(true); followGeneration.current++; try { await window.api?.followbackToggle(); await refreshFollowStatus() } finally { setFollowBusy(false) } }} label="Переключить автоподписку" />}</div>
+          <p className="signal-note">Подписывается в ответ.<br />Отписывается от тех, кто не подписан на тебя.</p>
+          {authHint && <p className="signal-note signal-auth-hint" role="status">{authHint}</p>}
+          {followError && <p className="signal-note" role="status">{followError}</p>}
+          <div className="signal-list-buttons"><button onClick={() => setListEditor('white')}>Белый список · {whitelist.length}</button><button onClick={() => setListEditor('black')}>Чёрный список · {blacklist.length}</button></div>
+        </section>
+      </div>
+    </div>
+    <section className="signal-tools"><button aria-expanded={toolsOpen} onClick={() => setToolsOpen(open => !open)} className="signal-tools-heading">Дополнительные функции</button>{toolsOpen && <div className="signal-tool-grid">
+      <section className="signal-card signal-tool signal-coming-soon"><span>Coming Soon</span></section>
+      <section className="signal-card signal-tool signal-coming-soon"><span>Coming Soon</span></section>
+      <section className="signal-card signal-tool signal-coming-soon"><span>Coming Soon</span></section>
+    </div>}</section>
+    <dialog ref={listDialog} className="signal-list-dialog" aria-labelledby="list-editor-title" onCancel={() => setListEditor(null)} onClose={() => setListEditor(null)} onClick={event => { if (event.target === event.currentTarget) { const r = event.currentTarget.getBoundingClientRect(); if (event.clientX < r.left || event.clientX > r.right || event.clientY < r.top || event.clientY > r.bottom) setListEditor(null) } }}>
+      <div className="signal-heading"><h2 id="list-editor-title">{listEditor === 'white' ? 'Белый список' : 'Чёрный список'}</h2><button aria-label="Закрыть список" onClick={() => setListEditor(null)}>×</button></div>
+      <p className="signal-note">{listEditor === 'white' ? 'Не отписываться от этих пользователей.' : 'Не подписываться в ответ. Входящие заявки остаются без изменений.'} Профиль {listProfile}.</p>
+      <form onSubmit={event => { event.preventDefault(); const value = listEditor === 'white' ? nickname : blockedNickname; if (!followBusy && value.trim()) { if (listEditor === 'white') saveWhitelist([...whitelist, value]); else saveBlacklist([...blacklist, value]) } }}>
+        <input autoFocus aria-label="Ник пользователя" placeholder="Ник пользователя" maxLength={100} value={listEditor === 'white' ? nickname : blockedNickname} onChange={event => listEditor === 'white' ? setNickname(event.target.value) : setBlockedNickname(event.target.value)} />
+        <button className="signal-primary" disabled={followBusy || !(listEditor === 'white' ? nickname : blockedNickname).trim()}>Добавить</button>
+      </form>
+      {followError && <p className="signal-note" role="status">{followError}</p>}
+      <div className="signal-whitelist-names">{(listEditor === 'white' ? whitelist : blacklist).map(name => <span key={name}>{name}<button disabled={followBusy} aria-label={'Убрать из списка: ' + name} onClick={() => listEditor === 'white' ? saveWhitelist(whitelist.filter(n => n !== name)) : saveBlacklist(blacklist.filter(n => n !== name))}>×</button></span>)}</div>
+    </dialog>
+  </div>
 }

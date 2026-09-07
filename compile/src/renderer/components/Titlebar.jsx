@@ -1,33 +1,14 @@
 import iconUrl from '../icon.png'
 
-export default function Titlebar({ collapsed, onToggleSidebar, version }) {
-  const win = () => window.api
-  return (
-    <div className="h-11 flex items-center gap-3 px-3 bg-[#0d0e15] select-none shrink-0 border-b border-white/[0.07] rounded-tr-[16px]" style={{ WebkitAppRegion: 'drag' }}>
-      <button onClick={onToggleSidebar} className="w-7 h-7 grid place-items-center rounded-lg hover:bg-white/5 text-zinc-400 hover:text-white shrink-0" style={{ WebkitAppRegion: 'no-drag' }}>
-        <span className="text-base leading-none">{collapsed ? '›' : '‹'}</span>
-      </button>
-      <div className="flex items-center gap-2.5 min-w-0">
-        <img src={iconUrl} alt="logo" className="w-7 h-7 rounded-lg object-cover shrink-0" />
-        <div className="leading-none hidden sm:block">
-          <div className="text-[13px] font-semibold tracking-[0]">Animeon</div>
-          <div className="text-[10px] text-zinc-500 -mt-0.5">Desktop · v{version || '...'}</div>
-        </div>
-      </div>
-      <div className="ml-auto flex items-center gap-0">
-        <button onClick={() => win()?.winMinimize?.()}
-          className="win-btn w-[46px] h-11 grid place-items-center text-zinc-400 rounded-none">
-          <svg width="10" height="1" viewBox="0 0 10 1" fill="currentColor"><rect width="10" height="1"/></svg>
-        </button>
-        <button onClick={() => win()?.winMaximize?.()}
-          className="win-btn w-[46px] h-11 grid place-items-center text-zinc-400 rounded-none">
-          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1"><rect x="0.5" y="0.5" width="9" height="9" rx="1"/></svg>
-        </button>
-        <button onClick={() => win()?.winClose?.()}
-          className="win-btn w-[46px] h-11 grid place-items-center text-zinc-400 rounded-none">
-          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2"><line x1="0" y1="0" x2="10" y2="10"/><line x1="10" y1="0" x2="0" y2="10"/></svg>
-        </button>
-      </div>
+export default function Titlebar({ version, onCommands }) {
+  return <header className="signal-titlebar" style={{ WebkitAppRegion: 'drag' }}>
+    <img className="signal-logo" src={iconUrl} alt="AnimeOn" />
+    <div className="signal-wordmark">ANIMEON<small>DESKTOP · V{version || '0.4.0'}</small></div>
+    <button className="signal-command" onClick={onCommands} aria-label="Найти функцию" title="Найти функцию (Ctrl+K)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg></button>
+    <div className="signal-window">
+      <button aria-label="Свернуть" title="Свернуть" onClick={() => window.api?.winMinimize?.()}><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M1 6h10" fill="none" stroke="currentColor"/></svg></button>
+      <button aria-label="Развернуть или восстановить" title="Развернуть / восстановить" onClick={() => window.api?.winMaximize?.()}><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><rect x="1.5" y="1.5" width="9" height="9" rx="1" fill="none" stroke="currentColor"/></svg></button>
+      <button aria-label="Закрыть" title="Закрыть" onClick={() => window.api?.winClose?.()}><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="m2 2 8 8M10 2l-8 8" fill="none" stroke="currentColor" strokeWidth="1.2"/></svg></button>
     </div>
-  )
+  </header>
 }

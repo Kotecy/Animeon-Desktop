@@ -4,13 +4,14 @@ import TabStrip from './components/TabStrip'
 import Dashboard from './pages/Dashboard'
 import Secrets from './pages/Secrets'
 import Settings from './pages/Settings'
+import { moscowTime } from './components/MoscowClock'
 import anomalySoundUrl from './assets/AnomalyDetected.mp3?inline'
 
 // Inline SVG icons to avoid import issues
 const HomeIcon = () => (
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="20" height="20">
-    <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
-    <polyline points="9 22 9 12 15 12 15 22"/>
+    <path d="M4 10V3l5 4a13 13 0 0 1 6 0l5-4v7a7 7 0 0 1 1 4c0 4-4 7-9 7s-9-3-9-7a7 7 0 0 1 1-4Z"/>
+    <path d="M8 12v1m8-1v1m-5 3 1 1 1-1M2 15l4 1m12 0 4-1"/>
   </svg>
 )
 
@@ -34,6 +35,9 @@ const SettingsIcon = () => (
 )
 
 export default function App() {
+  const [commandsOpen, setCommandsOpen] = useState(false)
+  const [commandQuery, setCommandQuery] = useState('')
+  const [commandError, setCommandError] = useState('')
   const [view, setView] = useState('site')
   const [tabs, setTabs] = useState([])
   const [order, setOrder] = useState([])
@@ -50,7 +54,7 @@ export default function App() {
   const followQueue = useRef([])
   const followToastRef = useRef(null)
   const siteNoticeTimer = useRef(null)
-  const pushEvent = (text) => setEvents(prev => [{ id: Date.now() + Math.random(), text, time: new Date().toLocaleTimeString() }, ...prev].slice(0, 10))
+  const pushEvent = (text) => setEvents(prev => [{ id: Date.now() + Math.random(), text, time: moscowTime() }, ...prev].slice(0, 10))
   // Очередь тостов подписки: по одному 6с; клик — пропуск к следующему.
   // В журнал — отдельная строка «Подписка: Ник» на каждый показ.
   const pumpFollow = () => {
@@ -73,17 +77,37 @@ export default function App() {
   const [anomalyToast, setAnomalyToast] = useState(null)
   const anomalyTimer = useRef(null)
   const soundBlockedRef = useRef(false)
+  useEffect(() => window.api?.onAnomalyCollected?.(result => {
+    const prefix = 'Автосбор: '
+    if (result.status === 'accepted') pushEvent(prefix + 'сервер принял запрос на сбор')
+    else if (result.status === 'failed') pushEvent(prefix + `сервер отклонил сбор (HTTP ${result.httpStatus || '—'})`)
+    else pushEvent(prefix + 'результат запроса неизвестен; повторная проверка через минуту')
+  }), [])
+  const soundEpoch = useRef(0)
+  const playingAudio = useRef(null)
+  useEffect(() => {
+    const stop = () => { soundEpoch.current++; playingAudio.current?.pause(); setAnomalyToast(null); clearTimeout(anomalyTimer.current) }
+    const clear = window.api?.onJournalClear?.(() => {
+      stop(); setEvents([]); setFbCheck(0); setFbSummary(null); lastSummaryTs.current = 0
+      clearTimeout(followTimer.current); followQueue.current = []; followToastRef.current = null; setFollowToast(null)
+    })
+    const detector = window.api?.onDetectorUpdated?.(d => { if (!d.watching || d.sound === false) stop() })
+    return () => { stop(); clear?.(); detector?.() }
+  }, [])
   const playAnomalySound = async () => {
+    const epoch = soundEpoch.current
     for (let i = 0; i < 3; i++) {
+      if (epoch !== soundEpoch.current) break
       try {
         const a = new Audio(anomalySoundUrl)
-        a.volume = 1
+        a.volume = 0.1
+        playingAudio.current = a
         await a.play()
       } catch {
         if (!soundBlockedRef.current) { soundBlockedRef.current = true; pushEvent('Звук заблокирован — кликни по окну один раз') }
         break
       }
-      if (i < 2) await new Promise(r => setTimeout(r, 700))
+      if (i < 2) await new Promise(r => setTimeout(r, 950))
     }
   }
 
@@ -123,7 +147,8 @@ export default function App() {
     window.addEventListener('pointerdown', primeAnomalyAudio, { once: true })
     window.addEventListener('keydown', primeAnomalyAudio, { once: true })
     const unsubscribeAnomaly = window.api?.onAnomalyDetected?.(async (info) => {
-      const time = new Date().toLocaleTimeString()
+      const epoch = soundEpoch.current
+      const time = moscowTime()
       pushEvent('Нашли аномалию')
       if (!info || info.toast !== false) {
         setAnomalyToast({ key: Date.now() + Math.random(), time })
@@ -132,7 +157,7 @@ export default function App() {
       }
       try {
         const d = await window.api?.storeGet('detector')
-        if (d && d.sound === false) return
+        if (!d?.watching || d.sound === false || epoch !== soundEpoch.current) return
         playAnomalySound()
       } catch {}
     })
@@ -153,7 +178,7 @@ export default function App() {
       if (activeTabId) setActiveId(activeTabId)
     })
     const unsubscribeNavigationBlocked = window.api?.onSiteNavigationBlocked?.(() => {
-      setSiteNotice('Введите корректный адрес Animeon: animeon.cc, animeon.co, v1.animeon.co или v2.animeon.co.')
+      setSiteNotice('Введите корректный адрес AnimeOn: animeon.cc, animeon.co, v1.animeon.co или v2.animeon.co.')
       if (siteNoticeTimer.current) clearTimeout(siteNoticeTimer.current)
       siteNoticeTimer.current = setTimeout(() => setSiteNotice(null), 5000)
     })
@@ -185,33 +210,40 @@ export default function App() {
     window.api?.sidebarSetCollapsed(next)
   }
 
+  useEffect(() => {
+    const key = event => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault(); setCommandsOpen(open => !open); setCommandQuery('')
+      }
+      if (event.key === 'Escape') setCommandsOpen(false)
+    }
+    window.addEventListener('keydown', key)
+    return () => window.removeEventListener('keydown', key)
+  }, [])
+  // Native website view must be hidden while an HTML overlay is open.
+  useEffect(() => {
+    if (commandsOpen) window.api?.viewSet('commands')
+    else window.api?.viewSet(view)
+  }, [commandsOpen, view])
+  const commands = [
+    { name: 'Детектор', run: async () => { try { const result = await window.api?.detectorToggle(true); if (result?.error) { setCommandError(result.error); return } setCommandsOpen(false) } catch { setCommandError('Не удалось включить детектор') } } },
+    { name: 'XP Чекер', run: async () => { try { const result = await window.api?.utilitiesToggle('xp-checker'); if (!result?.ok) { setCommandError(result?.error || 'Не удалось переключить инструмент'); return } setCommandsOpen(false) } catch { setCommandError('Не удалось переключить инструмент') } } }
+  ].filter(command => command.name.toLowerCase().includes(commandQuery.trim().toLowerCase()))
   const isSite = view === 'site'
 
   return (
     <>
     <div className="h-full flex flex-col bg-[#0b0c12] text-white rounded-[16px] overflow-hidden">
-      <Titlebar collapsed={collapsed} onToggleSidebar={toggleSidebar} version={version} />
+      <Titlebar version={version} onCommands={() => { setCommandsOpen(true); setCommandQuery(''); setCommandError('') }} />
       <div className="flex flex-1 min-h-0">
-        <nav className={`${collapsed ? 'w-[64px]' : 'w-[216px]'} shrink-0 bg-[#10111a] border-r border-white/[0.07] flex flex-col gap-1.5 py-4 ${collapsed ? 'px-2' : 'px-3'} transition-all duration-200`}>
+        <nav className="signal-rail">
           {[
-            { id: 'site', label: 'Главная', icon: HomeIcon, active: isSite },
-            { id: 'dashboard', label: 'Полезные функции', icon: BubbleIcon },
+            { id: 'site', label: 'Главная', icon: HomeIcon },
+            { id: 'dashboard', label: 'Функции', icon: BubbleIcon },
             { id: 'secrets', label: 'Секреты', icon: SecretsIcon },
             { id: 'settings', label: 'Настройки', icon: SettingsIcon },
-          ].map(item => {
-            const active = view === item.id || (item.id === 'site' && isSite)
-            return (
-              <button key={item.id} onClick={() => setAppView(item.id)}
-                title={collapsed ? item.label : undefined}
-                className={`${collapsed ? 'w-10 h-10 justify-center p-0' : 'px-3 h-10'} flex items-center gap-3 rounded-md text-sm transition-colors ${active ? 'bg-[#2c2545] text-white border border-violet-400/25 shadow-[inset_3px_0_0_#a855f7]' : 'text-zinc-400 hover:bg-white/[0.05] hover:text-white'}`}>
-                <span className={`${collapsed ? 'w-5 h-5' : 'w-5 h-5'} ${active ? 'text-violet' : ''}`}><item.icon /></span>
-                {!collapsed && <span>{item.label}</span>}
-              </button>
-            )
-          })}
-          <div className="mt-auto">
-            {!collapsed && <div className="text-[11px] text-zinc-500 px-2">v{version || '...'}</div>}
-          </div>
+          ].map(item => <button key={item.id} onClick={() => setAppView(item.id)} className={view === item.id ? 'active' : ''} title={item.label}><span className="nav-symbol" aria-hidden="true">{item.id === 'site' ? <HomeIcon /> : {dashboard:'◎',secrets:'✦',settings:'⚙'}[item.id]}</span><span>{item.label}</span></button>)}
+          <small>v{version || '0.4.0'}</small>
         </nav>
         <main className="flex-1 min-w-0 bg-[#0b0c12] flex flex-col overflow-hidden">
           <TabStrip tabs={tabs} order={order} activeId={activeId} onReorder={setOrder} onSwitch={switchSiteTab} isSite={isSite} baseUrl={baseUrl} />
@@ -237,6 +269,7 @@ export default function App() {
         </main>
       </div>
     </div>
+    {commandsOpen && <div className="signal-overlay" onClick={() => setCommandsOpen(false)}><section role="dialog" aria-modal="true" aria-label="Найти функцию" className="signal-palette" onClick={event => event.stopPropagation()}><input autoFocus value={commandQuery} onChange={event => setCommandQuery(event.target.value)} placeholder="Найти функцию…" />{commands.map(command => <button key={command.name} onClick={command.run}>{command.name}</button>)}{!commands.length && <p>Ничего не найдено</p>}{commandError && <p role="alert">{commandError}</p>}</section></div>}
     {/* Тосты уровня приложения — сверху по центру (y < 88): зону ниже
         перекрывает нативный BrowserView сайта, там их не видно. */}
     <div className="pointer-events-none fixed left-1/2 top-14 z-50 flex -translate-x-1/2 flex-col items-center gap-2">

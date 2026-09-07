@@ -3,6 +3,8 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
+  // Windows treats Public and public as the same directory; never copy release EXEs as Vite assets.
+  publicDir: false,
   base: './',
   build: {
     outDir: 'dist/renderer',

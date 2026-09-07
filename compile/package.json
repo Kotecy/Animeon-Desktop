@@ -1,22 +1,23 @@
 {
   "name": "animeon-desktop",
-  "version": "0.3.14",
-  "description": "Animeon Desktop",
+  "version": "0.4.0",
+  "description": "AnimeOn Desktop",
   "main": "dist/main/index.js",
   "type": "commonjs",
   "scripts": {
     "dev": "concurrently \"vite\" \"tsc -p tsconfig.main.json --watch\" \"wait-on dist/main/index.js && electron .\"",
     "dev:renderer": "vite",
     "dev:main": "tsc -p tsconfig.main.json --watch",
-    "build": "tsc -p tsconfig.main.json && vite build && electron-builder",
+    "build": "node scripts/build-release.cjs",
     "build:renderer": "vite build",
     "build:main": "tsc -p tsconfig.main.json",
     "preview": "vite preview",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "build:public": "node scripts/build-release.cjs --public"
   },
   "build": {
     "appId": "com.kotecy.animeon-desktop",
-    "productName": "Animeon Desktop",
+    "productName": "AnimeOn Desktop",
     "files": [
       "dist/**/*",
       "build/icon.png",
@@ -32,11 +33,13 @@
       "target": [
         {
           "target": "portable",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "icon": "build/icon.png",
-      "artifactName": "AnimeonDesktop.exe"
+      "artifactName": "AnimeOn Desktop.exe"
     },
     "directories": {
       "buildResources": "build",
@@ -47,7 +50,6 @@
     }
   },
   "dependencies": {
-    "chrome-cookies-secure": "^3.0.2",
     "electron-store": "^8.1.0",
     "electron-updater": "^6.3.9"
   },

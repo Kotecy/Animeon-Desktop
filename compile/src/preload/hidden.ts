@@ -14,8 +14,13 @@ try {
     storeGet: (key: string) => ipcRenderer.invoke('store:get', key),
     storeSet: (key: string, val: any) => ipcRenderer.invoke('store:set', key, val),
     anomalyDetected: (info: any) => ipcRenderer.invoke('anomaly:detected', info),
+    anomalyClaim: () => ipcRenderer.invoke('anomaly:claim'),
+    anomalyAction: (action: string) => ipcRenderer.invoke('anomaly:action', action),
+    followbackLists: () => ipcRenderer.invoke('followback:lists'),
     followbackNotify: (names: string[]) => ipcRenderer.invoke('followback:notify', names),
     followbackDiag: (msg: string) => ipcRenderer.invoke('followback:diag', msg),
     followbackHeartbeat: (ts: number) => ipcRenderer.invoke('followback:heartbeat', ts),
+    followbackClaim: (owner: string, renew: boolean) => ipcRenderer.invoke('followback:claim', owner, renew),
+    followbackFinish: (summary: any, claimed: boolean) => ipcRenderer.invoke('followback:finish', summary, claimed),
   })
 } catch {}

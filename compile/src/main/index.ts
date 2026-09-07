@@ -1,7 +1,8 @@
-import { app, BrowserWindow, BrowserView, ipcMain, powerMonitor, session, shell } from 'electron'
+import { app, BrowserWindow, BrowserView, Menu, ipcMain, powerMonitor, session, shell } from 'electron'
 import path from 'path'
 import fs from 'fs'
 import Store from 'electron-store'
+import { AUTO_COLLECT_AVAILABLE } from '../shared/buildFlags'
 
 process.on('uncaughtException', (err: any) => {
   if (String(err?.message || err).includes('SQLITE_CANTOPEN')) return
@@ -46,7 +47,8 @@ const store = new Store({
     activeTabId: null,
     activeView: 'site',
     detector: { watching: false, sound: true, toast: true, count: 0, lastAt: 0 },
-    followBackEnabled: false
+    followBackEnabled: false,
+    switchAllTabsOnProfileChange: true
   }
 })
 
@@ -72,6 +74,11 @@ function normalizeAccounts() {
   return accounts
 }
 normalizeAccounts()
+// Preserve the former shared whitelist for existing profiles once, then isolate edits.
+if (!store.get('followListsByProfile')) {
+  const legacy = store.get('followbackWhitelist') || []
+  store.set('followListsByProfile', Object.fromEntries(normalizeAccounts().map(a => [a.id, { whitelist: legacy, blacklist: [] }])))
+}
 
 // One-time purge of nicknames stored by the old scraper, which could save
 // nav text ("Онгоинги") or other users' nicks. They re-sync on next page load.
@@ -99,6 +106,21 @@ function setTabAudible(tabId: string, audible: boolean) {
     store.set('tabs', tabs)
     mainWindow?.webContents.send('tabs:updated', tabs, activeTabId)
   } catch {}
+}
+
+let collectionEpoch = 0
+const pendingCollections = new Set<() => void>()
+function cancelCollections() {
+  collectionEpoch++
+  for (const cancel of [...pendingCollections]) cancel()
+}
+function waitForCollection(): Promise<boolean> {
+  return new Promise(resolve => {
+    const finish = (ready: boolean) => { clearTimeout(timer); pendingCollections.delete(cancel); resolve(ready) }
+    const cancel = () => finish(false)
+    const timer = setTimeout(() => finish(true), 3000 + Math.floor(Math.random() * 7001))
+    pendingCollections.add(cancel)
+  })
 }
 
 let lastLimitInject = 0
@@ -145,16 +167,27 @@ function getActiveViewForToast(): any | null {
 
 function reloadActiveTab() {
   const view = getActiveViewForToast()
-  if (!view) return { ok: false, error: 'Нет открытой вкладки Animeon' }
+  if (!view) return { ok: false, error: 'Нет открытой вкладки AnimeOn' }
   try { view.webContents.reload(); return { ok: true } } catch { return { ok: false, error: 'Не удалось перезагрузить вкладку' } }
 }
 
+const hookedDevTools = new WeakSet<Electron.WebContents>()
 function toggleDevTools() {
   const contents = getActiveViewForToast()?.webContents || mainWindow?.webContents
   if (!contents) return false
   try {
     if (contents.isDevToolsOpened()) contents.closeDevTools()
-    else contents.openDevTools({ mode: 'detach' })
+    else {
+      if (!hookedDevTools.has(contents)) {
+        hookedDevTools.add(contents)
+        contents.on('devtools-opened', () => {
+          contents.devToolsWebContents?.on('before-input-event', (event: Electron.Event, input: Electron.Input) => {
+            if (input.type === 'keyDown' && input.key === 'F12') { event.preventDefault(); contents.closeDevTools() }
+          })
+        })
+      }
+      contents.openDevTools({ mode: 'detach' })
+    }
     return true
   } catch { return false }
 }
@@ -241,6 +274,7 @@ function switchTabAccount(accountId: string) {
 }
 
 async function syncAccountNickname(view: BrowserView, accountId: string) {
+  const mutationEpoch = accountMutationEpoch
   try {
     // Nickname is trusted only from a logged-in session (profile API answers).
     // Logged-out pages clear stale nicknames instead of scraping nav text.
@@ -261,6 +295,7 @@ async function syncAccountNickname(view: BrowserView, accountId: string) {
       }
       return {loggedIn,nickname};
     })()`, true)
+    if (mutationEpoch !== accountMutationEpoch || profileSwitchBusy) return false
     const accounts = normalizeAccounts()
     const account = accounts.find(a => a.id === String(accountId))
     if (!account) return false
@@ -292,14 +327,44 @@ let lastOAuthWindowTime = 0
 let isHtmlFullscreen = false
 const popupContents = new Set<number>()
 
-type UtilityId = 'xp-checker' | 'nya-logger'
+type UtilityId = 'xp-checker'
 type UtilityState = { id: UtilityId; tabId: string; startedAt: number; accountId: string }
 const utilityStates = new Map<string, UtilityState>()
 const enabledUtilities = new Set<UtilityId>()
-const UTILITY_FILES: Record<UtilityId | 'morse-decoder', string> = {
-  'xp-checker': 'XP_Check.txt',
-  'nya-logger': 'NyaLogger by Suchka322.txt',
-  'morse-decoder': 'Morse_Decoder.txt'
+let utilityEpoch = 0
+let profileSwitchBusy = false
+let accountMutationEpoch = 0
+async function clearProfileSession(key: string) {
+  if (!/^[1-5]$/.test(key)) throw new Error('Invalid profile')
+  const partition = `persist:animeon-acc-${key}`
+  const targetSession = session.fromPartition(partition)
+  const tabs: any[] = (store.get('tabs') as any[]) || []
+  const removed = new Set(tabs.filter(t => t.partition === partition).map(t => t.id))
+  for (const id of removed) destroyView(id)
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win !== mainWindow && !win.isDestroyed() && win.webContents.session === targetSession) win.destroy()
+  }
+  const remaining = tabs.filter(t => !removed.has(t.id))
+  store.set('tabs', remaining)
+  const order = ((store.get('tabOrder') as string[]) || []).filter(id => !removed.has(id))
+  store.set('tabOrder', order)
+  if (activeTabId && removed.has(activeTabId)) {
+    activeTabId = order[0] || remaining[0]?.id || null
+    store.set('activeTabId', activeTabId)
+  }
+  layoutViews()
+  mainWindow?.webContents.send('tabs:updated', remaining, activeTabId)
+  await targetSession.closeAllConnections()
+  await targetSession.clearStorageData()
+  await targetSession.clearAuthCache()
+  await targetSession.clearCache()
+  await targetSession.cookies.flushStore()
+  const lists: any = store.get('followListsByProfile') || {}
+  delete lists[key]
+  store.set('followListsByProfile', lists)
+}
+const UTILITY_FILES: Record<UtilityId, string> = {
+  'xp-checker': 'XP_Check.txt'
 }
 
 function notifyUtilities() {
@@ -308,7 +373,7 @@ function notifyUtilities() {
 
 function utilityKey(id: UtilityId, tabId: string) { return `${id}:${tabId}` }
 
-function getUtilitySource(id: UtilityId | 'morse-decoder') {
+function getUtilitySource(id: UtilityId) {
   // Скрипты лежат в src/source/scripts: в dev это <root>/src/source/scripts,
   // в сборке files[] сохраняет относительный путь — тот же адрес в asar.
   const scriptPath = path.join(app.getAppPath(), 'src', 'source', 'scripts', UTILITY_FILES[id])
@@ -326,9 +391,7 @@ async function stopUtilityInTab(id: UtilityId, tabId: string) {
   const active = utilityStates.get(utilityKey(id, tabId))
   if (!active) return
   const view = views.get(tabId)
-  const stopExpression = id === 'xp-checker'
-    ? 'window.__ANIMEON_XP_MONITOR__?.stop?.()'
-    : 'window.__NYA_LOGGER__?.stop?.()'
+  const stopExpression = 'window.__ANIMEON_XP_MONITOR__?.stop?.()'
   try { await view?.webContents.executeJavaScript(stopExpression, true) } catch {}
   utilityStates.delete(utilityKey(id, tabId))
 }
@@ -343,12 +406,65 @@ async function stopUtility(id: UtilityId) {
 
 async function getActiveNickname(view: BrowserView) {
   const accountId = String((view as any).__accountId || store.get('activeAccountId') || '1')
-  await syncAccountNickname(view, accountId)
-  const account = normalizeAccounts().find(a => String(a.id) === accountId)
-  return { accountId, nickname: String(account?.nickname || '').trim() }
+  // Resolve the session owner, never the visited profile or a persisted display name.
+  // TARGET_USER remains fixed for this script instance after injection.
+  const nickname = await view.webContents.executeJavaScript(`(async()=>{
+    for(const path of ['/api/auth/me','/api/users/me','/api/user/profile','/api/profile']) {
+      try {
+        const response=await fetch(path,{credentials:'include',cache:'no-store',signal:AbortSignal.timeout(8000)});
+        if(response.status===401||response.status===403)return '';
+        if(!response.ok)continue;
+        const body=await response.json();
+        const data=body?.data??body;
+        const user=data?.user??data?.profile??data;
+        const nick=user?.username_slug||user?.slug||user?.username||user?.nickname;
+        if(typeof nick==='string'&&nick.trim()&&nick.trim().toLowerCase()!=='me')return nick.trim();
+      } catch {}
+    }
+    return '';
+  })()`, true)
+  if (String((view as any).__accountId || '1') !== accountId) return { accountId, nickname: '' }
+  return { accountId, nickname: typeof nickname === 'string' ? nickname : '' }
+}
+
+let authCache: { profileId: string, epoch: number, authenticated: boolean, checkedAt: number } | null = null
+let authPending: { profileId: string, epoch: number, promise: Promise<{ profileId: string, authenticated: boolean }> } | null = null
+let detectorToggleRevision = 0
+let followToggleRevision = 0
+function stopUnauthenticatedFunctions() {
+  const d: any = store.get('detector') || {}
+  detectorToggleRevision++; followToggleRevision++
+  if (d.watching || d.autoCollect) {
+    d.watching = false; d.autoCollect = false; cancelCollections()
+    store.set('detector', d)
+    mainWindow?.webContents.send('detector:updated', d)
+  }
+  if (store.get('followBackEnabled')) {
+    store.set('followBackEnabled', false)
+    mainWindow?.webContents.send('followback:stateChanged')
+  }
+}
+async function getFeatureAuth(force = false): Promise<{ profileId: string, authenticated: boolean }> {
+  const profileId = String(store.get('activeAccountId') || '1'), epoch = utilityEpoch
+  if (profileSwitchBusy) return { profileId, authenticated: false }
+  if (authPending?.profileId === profileId && authPending.epoch === epoch) return authPending.promise
+  if (!force && authCache?.profileId === profileId && authCache.epoch === epoch && Date.now() - authCache.checkedAt < 5000) return authCache
+  const promise = (async () => {
+    let authenticated = false
+    const view = [...views.values()].find(v => !v.webContents.isDestroyed() && String((v as any).__accountId) === profileId && !!normalizeAnimeonUrl(v.webContents.getURL()))
+    try { if (view) authenticated = !!(await getActiveNickname(view)).nickname } catch {}
+    if (epoch !== utilityEpoch || profileId !== String(store.get('activeAccountId') || '1') || profileSwitchBusy) return { profileId, authenticated: false }
+    authCache = { profileId, epoch, authenticated, checkedAt: Date.now() }
+    if (!authenticated) stopUnauthenticatedFunctions()
+    mainWindow?.webContents.send('auth:updated', { profileId, authenticated })
+    return { profileId, authenticated }
+  })()
+  authPending = { profileId, epoch, promise }
+  try { return await promise } finally { if (authPending?.promise === promise) authPending = null }
 }
 
 async function startUtilityInTab(id: UtilityId, tabId: string, view: BrowserView) {
+  const epoch = utilityEpoch
   if (utilityStates.has(utilityKey(id, tabId))) return true
   try {
     let source = getUtilitySource(id)
@@ -359,7 +475,12 @@ async function startUtilityInTab(id: UtilityId, tabId: string, view: BrowserView
       if (!profile.nickname) return false
       source = source.replace("const TARGET_USER = 'username';", `const TARGET_USER = ${JSON.stringify(profile.nickname)};`)
     }
+    if (epoch !== utilityEpoch || !enabledUtilities.has(id)) return false
     await view.webContents.executeJavaScript(source, true)
+    if (epoch !== utilityEpoch || !enabledUtilities.has(id)) {
+      await view.webContents.executeJavaScript('window.__ANIMEON_XP_MONITOR__?.stop?.()').catch(() => {})
+      return false
+    }
     utilityStates.set(utilityKey(id, tabId), { id, tabId, accountId, startedAt: Date.now() })
     return true
   } catch (error: any) {
@@ -371,7 +492,7 @@ async function startUtilityInTab(id: UtilityId, tabId: string, view: BrowserView
 async function startUtility(id: UtilityId) {
   enabledUtilities.add(id)
   const tabs: any[] = (store.get('tabs') as any[]) || []
-  if (!tabs.length) return { ok: false, error: 'Откройте вкладку Animeon для запуска инструмента' }
+  if (!tabs.length) return { ok: false, error: 'Откройте вкладку AnimeOn для запуска инструмента' }
   for (const tab of tabs) ensureView(tab)
   const started = await Promise.all(tabs.map(async tab => {
     const view = views.get(tab.id)
@@ -379,8 +500,11 @@ async function startUtility(id: UtilityId) {
   }))
   notifyUtilities()
   if (!started.some(Boolean)) {
+    enabledUtilities.delete(id)
+    notifyUtilities()
     const account = normalizeAccounts().find(a => String(a.id) === String(store.get('activeAccountId') || '1'))
-    if (id === 'xp-checker' && !account?.nickname) return { ok: false, error: 'Войдите в Animeon: ник активного профиля ещё не определён' }
+    if (id === 'xp-checker' && !account?.nickname) return { ok: false, error: 'Войдите в AnimeOn: ник активного профиля ещё не определён' }
+    return { ok: false, error: 'Не удалось определить аккаунт или запустить XP Чекер' }
   }
   return { ok: true, active: true, tabs: started.filter(Boolean).length }
 }
@@ -411,10 +535,10 @@ function getContentBounds() {
     const [w, h] = mainWindow!.getSize()
     return { x: 0, y: 0, width: w, height: h }
   }
-  const sidebarW = (store.get('sidebarCollapsed') as boolean) ? 64 : 216
-  if (!mainWindow) return { x: sidebarW, y: 88, width: 1060, height: 712 }
+  const sidebarW = 72
+  if (!mainWindow) return { x: sidebarW, y: 99, width: 1060, height: 712 }
   const [winW, winH] = mainWindow.getSize()
-    return { x: sidebarW + 2, y: 88, width: Math.max(400, winW - sidebarW - 6), height: Math.max(200, winH - 94) }
+    return { x: sidebarW, y: 99, width: Math.max(1, winW - sidebarW), height: Math.max(1, winH - 99) }
 }
 
 // The site logs in via POST /api/auth/google with { id_token } (see its
@@ -486,43 +610,24 @@ function ensureView(tab: any) {
   let view = views.get(tab.id)
   if (!view) {
     const ses = session.fromPartition(tab.partition)
-    try {
-      ses.webRequest.onBeforeRequest((details, cb) => {
-        try {
-          if (details.url.includes('gsi/transform') && details.method === 'POST') {
-            const rb: any = (details as any).requestBody || {}
-            debugLog('transform FULL-POST url=', safeUrl(details.url), 'formKeys=', Object.keys((rb as any)?.formData || rb || {}).join(','))
-            let idToken = ''
-            try { if (rb && rb.formData && (rb.formData.id_token || rb.formData.credential)) idToken = String(rb.formData.id_token || rb.formData.credential) } catch {}
-            try {
-              if (!idToken && rb && Array.isArray(rb.raw)) {
-                const str = Buffer.concat(rb.raw.map((r: any) => Buffer.isBuffer(r.bytes) ? r.bytes : Buffer.from(r.bytes || ''))).toString('utf8')
-                const mt = str.match(/(?:id_token|credential)=([^&\s]+)/)
-                if (mt) idToken = decodeURIComponent(mt[1])
-              }
-            } catch {}
-            debugLog('transform POST url=', safeUrl(details.url), 'hasRaw=', !!(rb && Array.isArray(rb.raw)), 'idTokenLen=', idToken.length)
-            if (idToken.length > 20) completeGoogleAuthViaTab(idToken)
-          }
-        } catch {}
-        cb({})
-      })
-    } catch {}
     view = new BrowserView({
       webPreferences: {
         session: ses,
         preload: getPreloadPath('hidden.js'),
         contextIsolation: true,
         nodeIntegration: false,
-        sandbox: false
+        sandbox: true
       }
     })
     views.set(tab.id, view)
     // Вкладки продолжают выполнять таймеры и fetch, когда окно свёрнуто
     // или BrowserView временно вынесен за пределы окна.
     try { view.webContents.setBackgroundThrottling(false) } catch {}
-    view.webContents.on('media-started-playing', () => setTabAudible(tab.id, true))
-    ;(view.webContents as any).on('media-paused-playing', () => setTabAudible(tab.id, false))
+    view.webContents.on('focus', () => mainWindow?.webContents.send('site:focused'))
+    // Track audio emission independently of the tab's muted setting, without polling.
+    const audioContents = view.webContents
+    audioContents.on('audio-state-changed', event => setTabAudible(tab.id, event.audible))
+    setTabAudible(tab.id, audioContents.isCurrentlyAudible())
     view.webContents.on('render-process-gone', (_e, details) => {
       debugLog('DIAG view render-process-gone tab=', tab.id, JSON.stringify(details))
     })
@@ -551,13 +656,6 @@ function ensureView(tab: any) {
       if (t) { t.title = title; store.set('tabs', tabs); mainWindow?.webContents.send('tabs:updated', tabs, activeTabId) }
     })
     view.webContents.on('did-navigate', (_e, url) => {
-      if (url.includes('gsi/transform')) {
-        debugLog('tab:did-navigate gsi/transform FULL=', url)
-        // Some GIS variants deliver id_token in the URL (query/fragment)
-        // for response_mode=fragment / implicit grant.
-        const m = url.match(/[?#&](id_token|credential)=([^&]+)/)
-        if (m) { debugLog('transform url id_token len=', m[2].length); completeGoogleAuthViaTab(decodeURIComponent(m[2])) }
-      } else if (/accounts\.google\.com/.test(url)) debugLog('tab:did-navigate', url.split('?')[0])
       const tabs: any[] = (store.get('tabs') as any[]) || []
       const t = tabs.find((x) => x.id === tab.id)
       if (t) { t.url = url; store.set('tabs', tabs) }
@@ -701,7 +799,7 @@ function createMainWindow() {
       try { view.webContents.setBackgroundThrottling(false) } catch {}
     }
   })
-  mainWindow.on('close', () => debugLog('DIAG main window close'))
+  mainWindow.on('close', () => { resetRunFlags(); debugLog('DIAG main window close') })
 
   mainWindow.on('resize', layoutViews)
   mainWindow.on('maximize', layoutViews)
@@ -721,6 +819,8 @@ function createMainWindow() {
   ipcMain.handle('store:set', (_e, key, val) => { (store as any).set(key, val); return true })
   ipcMain.handle('store:getAll', () => (store as any).store)
   ipcMain.handle('accounts:list', async () => {
+    const mutationEpoch = accountMutationEpoch
+    if (profileSwitchBusy) return normalizeAccounts()
     const accounts = normalizeAccounts()
     // Best effort: when a profile tab is already loaded, ask AnimeOn for the
     // current user and persist the nickname alongside the account id.
@@ -752,31 +852,48 @@ function createMainWindow() {
         }
       } catch {}
     }
+    if (mutationEpoch !== accountMutationEpoch) return normalizeAccounts()
     store.set('accounts', accounts)
     notifyAccounts()
     return accounts
   })
-  ipcMain.handle('accounts:add', () => {
+  ipcMain.handle('accounts:add', async () => {
+    if (profileSwitchBusy) return null
+    profileSwitchBusy = true
+    accountMutationEpoch++
+    try {
     const accounts = normalizeAccounts()
-    if (accounts.length >= 5) return null
+    if (accounts.length >= 4) return null
     const used = new Set(accounts.map(a => String(a.id)))
-    let n = 1; while (used.has(String(n)) && n <= 5) n++
-    if (n > 5) return null
+    let n = 1; while (used.has(String(n)) && n <= 4) n++
+    if (n > 4) return null
+    await clearProfileSession(String(n))
     const profile = { id: String(n), nickname: '', createdAt: Date.now() }
     accounts.push(profile)
     accounts.sort((a, b) => Number(a.id) - Number(b.id))
     store.set('accounts', accounts)
     notifyAccounts()
     return profile
+    } finally { profileSwitchBusy = false }
   })
-  ipcMain.handle('accounts:select', (_e, id: string | number) => {
+  ipcMain.handle('accounts:select', async (_e, id: string | number) => {
     const key = String(id)
     const accounts = normalizeAccounts()
     if (!accounts.some(a => a.id === key)) return false
+    if (String(store.get('activeAccountId')) === key) return true
+    if (profileSwitchBusy) return false
+    profileSwitchBusy = true
+    try {
+    resetRunFlags()
+    utilityEpoch++
+    await stopUtility('xp-checker')
+    mainWindow?.webContents.send('detector:updated', store.get('detector'))
+    mainWindow?.webContents.send('followback:stateChanged')
     store.set('activeAccountId', key)
     if (activeTabId) applyAccountToTabs(key)
     notifyAccounts()
     return true
+    } finally { profileSwitchBusy = false }
   })
   ipcMain.handle('accounts:setNickname', (_e, id: string | number, nickname: string) => {
     const key = String(id)
@@ -788,23 +905,39 @@ function createMainWindow() {
     notifyAccounts()
     return account
   })
-  ipcMain.handle('accounts:remove', (_e, id: string | number) => {
+  ipcMain.handle('accounts:remove', async (_e, id: string | number) => {
+    if (profileSwitchBusy) return false
     const key = String(id)
     const accounts = normalizeAccounts()
     if (!accounts.some(a => a.id === key)) return false
+    profileSwitchBusy = true
+    accountMutationEpoch++
+    try {
+    resetRunFlags()
+    utilityEpoch++
+    await stopUtility('xp-checker')
+    mainWindow?.webContents.send('detector:updated', store.get('detector'))
+    mainWindow?.webContents.send('followback:stateChanged')
+    await clearProfileSession(key)
     const next = accounts.filter(a => a.id !== key)
-    if (!next.length) next.push({ id: '1', nickname: '', createdAt: Date.now() })
+    if (key === '1' || !next.length) next.push({ id: '1', nickname: '', createdAt: Date.now() })
     next.sort((a, b) => Number(a.id) - Number(b.id))
     store.set('accounts', next)
     if (String(store.get('activeAccountId')) === key) {
       const fallback = String(next[0].id)
       store.set('activeAccountId', fallback)
-      switchTabAccount(fallback)
     }
+    if (!activeTabId) {
+      const tab = createTabFromUrl(String(store.get('baseUrl')))
+      if (tab) { activeTabId = tab.id; store.set('activeTabId', tab.id); layoutViews() }
+    }
+    mainWindow?.webContents.send('tabs:updated', store.get('tabs'), activeTabId)
     notifyAccounts()
     return true
+    } finally { profileSwitchBusy = false }
   })
   ipcMain.handle('tabs:create', (_e, url) => {
+    if (profileSwitchBusy) return null
     const id = Date.now().toString()
     const tabs: any[] = (store.get('tabs') as any[]) || []
     if (tabs.length >= 5) { debugLog('DIAG tabs:create at limit'); notifyTabLimit(); return null }
@@ -860,7 +993,7 @@ function createMainWindow() {
   })
   ipcMain.handle('tabs:navigate', (_e, id: string, url: string) => {
     const safeUrl = normalizeAnimeonUrl(url)
-    if (!safeUrl) return { ok: false, error: 'Введите корректный адрес Animeon: animeon.cc, animeon.co, v1.animeon.co или v2.animeon.co.' }
+    if (!safeUrl) return { ok: false, error: 'Введите корректный адрес AnimeOn: animeon.cc, animeon.co, v1.animeon.co или v2.animeon.co.' }
     try {
       const tabs: any[] = (store.get('tabs') as any[]) || []
       const tab = tabs.find(t => t.id === id)
@@ -932,8 +1065,18 @@ function createMainWindow() {
     mainWindow?.webContents.send('tabs:updated', tabs, activeTabId)
     return true
   })
+  ipcMain.handle('tabs:contextMenu', (_e, id: string) => {
+    const tab = ((store.get('tabs') as any[]) || []).find(tab => tab.id === id)
+    if (!tab || !mainWindow) return
+    const send = (action: string) => mainWindow?.webContents.send('tabs:menuAction', id, action)
+    Menu.buildFromTemplate([
+      { label: tab.pinned ? 'Открепить вкладку' : 'Закрепить вкладку', click: () => send('pin') },
+      { label: tab.muted ? 'Включить звук' : 'Выключить звук', click: () => send('mute') },
+      { label: 'Обновить страницу', enabled: id === activeTabId, click: () => send('reload') }
+    ]).popup({ window: mainWindow })
+  })
   ipcMain.handle('view:set', (_e, mode: string) => {
-    activeViewMode = mode; store.set('activeView', mode); layoutViews(); return true
+    activeViewMode = mode; if (mode !== 'commands') store.set('activeView', mode); layoutViews(); return true
   })
   ipcMain.handle('sidebar:setCollapsed', (_e, v: boolean) => { store.set('sidebarCollapsed', v); layoutViews(); return true })
   ipcMain.handle('app:version', () => app.getVersion())
@@ -967,7 +1110,7 @@ function createMainWindow() {
   ipcMain.handle('google:login', async () => {
     const id = activeTabId || (store.get('tabOrder') as string[])?.[0]
     const view = id ? views.get(id) : null
-    if (!view) return { ok: false, error: 'Нет вкладки Animeon' }
+    if (!view) return { ok: false, error: 'Нет вкладки AnimeOn' }
     const current = view.webContents.getURL()
     const target = normalizeAnimeonUrl(current) ? current : (store.get('baseUrl') as string)
     try {
@@ -983,7 +1126,7 @@ function createMainWindow() {
     const target = view || [...views.values()].find(v => {
       try { return !!normalizeAnimeonUrl(v.webContents.getURL()) } catch { return false }
     })
-    if (!target) return { ok: false, error: 'Нет вкладки Animeon' }
+    if (!target) return { ok: false, error: 'Нет вкладки AnimeOn' }
     try {
       const data = await target.webContents.executeJavaScript(`
         fetch('/api/achievements', { credentials: 'include' }).then(r => r.ok ? r.json() : Promise.reject(r.status)).catch(e => ({ __error: String(e) }))
@@ -992,29 +1135,40 @@ function createMainWindow() {
       return { ok: true, data }
     } catch (e) { return { ok: false, error: String(e) } }
   })
+  ipcMain.handle('anomaly:state', async () => {
+    const target = activeTabId ? views.get(activeTabId) : null
+    if (!target || !normalizeAnimeonUrl(target.webContents.getURL())) return { ok: false, error: 'Откройте вкладку AnimeOn' }
+    try {
+      return await target.webContents.executeJavaScript(`(async () => {
+        const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 8000);
+        try {
+          const response = await fetch('/api/event/boar/anomaly/state', { credentials: 'include', signal: controller.signal });
+          if (!response.ok) return { ok: false, error: response.status === 401 ? 'Войдите в аккаунт' : 'Не удалось загрузить остаток' };
+          const data = await response.json();
+          return Number.isInteger(data.remaining_today) && data.remaining_today >= 0
+            ? { ok: true, remaining: data.remaining_today } : { ok: false, error: 'Данные остатка недоступны' };
+        } catch { return { ok: false, error: 'Нет соединения с сайтом' } } finally { clearTimeout(timer) }
+      })()`)
+    } catch { return { ok: false, error: 'Не удалось загрузить остаток' } }
+  })
+  ipcMain.handle('auth:state', () => getFeatureAuth())
   ipcMain.handle('utilities:list', () => [...utilityStates.values()])
   ipcMain.handle('utilities:toggle', async (_e, rawId: UtilityId) => {
-    const id = rawId === 'xp-checker' || rawId === 'nya-logger' ? rawId : null
+    const id = rawId === 'xp-checker' ? rawId : null
     if (!id) return { ok: false, error: 'Неизвестный инструмент' }
     if ([...utilityStates.values()].some(state => state.id === id)) return stopUtility(id)
     return startUtility(id)
   })
-  ipcMain.handle('utilities:runMorse', async () => {
-    const target = getUtilityView()
-    if (!target) return { ok: false, error: 'Откройте вкладку Animeon для запуска декодера' }
-    let pathname = ''
-    try { pathname = new URL(target.view.webContents.getURL()).pathname } catch {}
-    if (pathname !== '/2501') return { ok: false, error: 'Декодер Морзе доступен только на странице Animeon /2501.' }
-    try {
-      const result = await target.view.webContents.executeJavaScript(getUtilitySource('morse-decoder'), true)
-      return result && result.ok ? result : { ok: false, error: result?.error || 'Не удалось получить код Морзе' }
-    } catch (error: any) {
-      return { ok: false, error: String(error?.message || error) }
-    }
-  })
-  ipcMain.handle('detector:toggle', () => {
+  ipcMain.handle('detector:toggle', async (_event, enabled?: boolean) => {
+    const revision = ++detectorToggleRevision, epoch = utilityEpoch
     const d: any = (store as any).get('detector') || { watching: false, sound: true, count: 0, lastAt: 0 }
-    d.watching = !d.watching
+    const next = typeof enabled === 'boolean' ? enabled : !d.watching
+    if (next) {
+      const auth = await getFeatureAuth(true)
+      if (!auth.authenticated || epoch !== utilityEpoch || revision !== detectorToggleRevision) return { ...(store.get('detector') as any), error: 'Войдите в аккаунт' }
+    }
+    d.watching = next
+    if (!d.watching) { d.autoCollect = false; cancelCollections() }
     ;(store as any).set('detector', d)
     mainWindow?.webContents.send('detector:updated', d)
     return d
@@ -1022,6 +1176,8 @@ function createMainWindow() {
   ipcMain.handle('detector:sound', () => {
     const d: any = (store as any).get('detector') || { watching: false, sound: true, count: 0, lastAt: 0 }
     d.sound = d.sound === undefined ? false : !d.sound
+    d.toast = d.sound
+    if (!d.sound) for (const view of views.values()) view.webContents.executeJavaScript("document.querySelectorAll('[data-animeon-anomaly]').forEach(el => el.remove())").catch(() => {})
     ;(store as any).set('detector', d)
     mainWindow?.webContents.send('detector:updated', d)
     return d
@@ -1029,17 +1185,154 @@ function createMainWindow() {
   ipcMain.handle('detector:toast', () => {
     const d: any = (store as any).get('detector') || { watching: false, sound: true, count: 0, lastAt: 0 }
     d.toast = d.toast === undefined ? false : !d.toast
+    d.sound = d.toast
     ;(store as any).set('detector', d)
     mainWindow?.webContents.send('detector:updated', d)
     return d
   })
-  ipcMain.handle('followback:toggle', () => {
-    const v = !store.get('followBackEnabled'); store.set('followBackEnabled', v); return v
+  const followLocks = new Map<string, { sender: number, owner: string, until: number }>()
+  ipcMain.handle('detector:collect', async () => {
+    const epoch = utilityEpoch, runEpoch = collectionEpoch
+    if (!await getFeatureAuth(true).then(s => s.authenticated) || epoch !== utilityEpoch || runEpoch !== collectionEpoch) return store.get('detector')
+    const d: any = store.get('detector') || {}
+    d.autoCollect = AUTO_COLLECT_AVAILABLE && !!d.watching && !d.autoCollect
+    if (!d.autoCollect) cancelCollections()
+    store.set('detector', d)
+    mainWindow?.webContents.send('detector:updated', d)
+    return d
+  })
+  const collectAttempts = new Map<string, number>()
+  const collectInFlight = new Set<string>()
+  ipcMain.handle('anomaly:claim', async event => {
+    const sender = event.sender
+    const view = [...views.values()].find(v => v.webContents === sender)
+    if (!view || sender.isDestroyed()) return { status: 'skipped' }
+    const profile = String((view as any).__accountId)
+    const originUrl = normalizeAnimeonUrl(sender.getURL())
+    if (!originUrl) return { status: 'skipped' }
+    const origin = new URL(originUrl).origin
+    const epoch = utilityEpoch
+    const runEpoch = collectionEpoch
+    const allowed = () => {
+      const d: any = store.get('detector') || {}
+      return AUTO_COLLECT_AVAILABLE && runEpoch === collectionEpoch && !profileSwitchBusy && epoch === utilityEpoch && d.watching && d.autoCollect && !sender.isDestroyed() &&
+        [...views.values()].includes(view) && String((view as any).__accountId) === profile &&
+        normalizeAnimeonUrl(sender.getURL()) && new URL(sender.getURL()).origin === origin
+    }
+    if (!allowed() || collectInFlight.has(profile) || Date.now() - (collectAttempts.get(profile) || 0) < 60000) return { status: 'skipped' }
+    collectInFlight.add(profile)
+    collectAttempts.set(profile, Date.now())
+    try {
+      if (!await waitForCollection() || !allowed()) return { status: 'skipped' }
+      // Fresh server eligibility after the delay; no DOM/button requirement or navigation.
+      const ready = await sender.executeJavaScript(`(async()=>{
+        const r=await fetch('/api/event/boar/anomaly/state',{credentials:'include',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+        if(!r.ok)throw new Error('state HTTP '+r.status);
+        const j=await r.json();return j?.eligible===true;
+      })()`, true)
+      if (!ready || !allowed()) return { status: 'skipped' }
+      const result = await sender.executeJavaScript(`(async()=>{
+        const r=await fetch('/api/event/boar/anomaly/claim',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',redirect:'error',signal:AbortSignal.timeout(10000)});
+        const j=await r.json().catch(()=>null);
+        return {status:r.ok&&!(j&&(j.success===false||j.ok===false||j.error))?'accepted':'failed',httpStatus:r.status};
+      })()`, true)
+      if (allowed()) mainWindow?.webContents.send('anomaly:collect-result', { status: result?.status === 'accepted' ? 'accepted' : 'failed', httpStatus: result?.httpStatus, profileId: profile })
+      return result
+    } catch {
+      if (allowed()) mainWindow?.webContents.send('anomaly:collect-result', { status: 'unknown', profileId: profile })
+      return { status: 'unknown' }
+    } finally {
+      collectAttempts.set(profile, Date.now())
+      collectInFlight.delete(profile)
+    }
+  })
+  ipcMain.handle('anomaly:action', (event, action: string) => {
+    const view = [...views.values()].find(v => v.webContents === event.sender)
+    const d: any = store.get('detector') || {}
+    if (!view || !d.watching || !normalizeAnimeonUrl(event.sender.getURL())) return false
+    if (action === 'gone') return true
+    if (action === 'refresh') return false
+    return false
+  })
+  const profileForSender = (sender: Electron.WebContents) => {
+    const view = [...views.values()].find(view => view.webContents.id === sender.id)
+    return view ? String((view as any).__accountId) : null
+  }
+  const followState = () => {
+    const profile = String(store.get('activeAccountId') || '1')
+    const states: any = store.get('followbackStates') || {}
+    const lists: any = store.get('followListsByProfile') || {}
+    return { enabled: !!store.get('followBackEnabled'), profileId: profile, whitelist: lists[profile]?.whitelist || [], blacklist: lists[profile]?.blacklist || [], ...(states[profile] || {}) }
+  }
+  ipcMain.handle('followback:state', followState)
+  const saveFollowList = (names: unknown, profile: string, kind: 'whitelist' | 'blacklist') => {
+    if (profileSwitchBusy || profile !== String(store.get('activeAccountId'))) throw new Error('Профиль изменился')
+    if (!Array.isArray(names) || names.length > 500 || names.some(n => typeof n !== 'string' || n.length > 100)) throw new Error('Некорректный список ников')
+    const normalized = [...new Set(names.map(n => n.normalize('NFKC').trim().replace(/^@/, '').toLowerCase()).filter(Boolean))]
+    const lists: any = store.get('followListsByProfile') || {}
+    lists[profile] = { whitelist: [], blacklist: [], ...lists[profile], [kind]: normalized }
+    store.set('followListsByProfile', lists)
+    mainWindow?.webContents.send('followback:stateChanged')
+    return normalized
+  }
+  ipcMain.handle('followback:whitelist', (_e, names: unknown, profile: string) => saveFollowList(names, profile, 'whitelist'))
+  ipcMain.handle('followback:blacklist', (_e, names: unknown, profile: string) => saveFollowList(names, profile, 'blacklist'))
+  ipcMain.handle('followback:lists', event => {
+    const profile = profileForSender(event.sender)
+    const lists: any = store.get('followListsByProfile') || {}
+    return profile ? (lists[profile] || { whitelist: [], blacklist: [] }) : { whitelist: [], blacklist: [] }
+  })
+  ipcMain.handle('followback:claim', (event, owner: string, renew: boolean) => {
+    const profile = profileForSender(event.sender)
+    if (!profile || !store.get('followBackEnabled') || typeof owner !== 'string' || !owner.trim()) return { ok: false }
+    const now = Date.now(), lock = followLocks.get(profile)
+    if (renew) {
+      if (!lock || lock.sender !== event.sender.id || lock.owner !== owner || lock.until < now) return { ok: false }
+      lock.until = now + 60000
+      return { ok: true }
+    }
+    if (lock && lock.until > now) return { ok: false }
+    const states: any = store.get('followbackStates') || {}
+    if (states[profile]?.owner === owner && states[profile]?.nextAt > now) return { ok: false }
+    followLocks.set(profile, { sender: event.sender.id, owner, until: now + 60000 })
+    return { ok: true }
+  })
+  ipcMain.handle('followback:finish', (event, summary: any, claimed: boolean) => {
+    const profile = profileForSender(event.sender)
+    if (!profile || !summary || typeof summary !== 'object') return
+    const lock = followLocks.get(profile)
+    if (claimed && lock?.sender !== event.sender.id) return
+    if (!claimed && lock && lock.until > Date.now()) return
+    if (claimed) followLocks.delete(profile)
+    const states: any = store.get('followbackStates') || {}
+    const ts = Date.now()
+    states[profile] = { owner: lock?.owner || '', lastCheck: summary.ok ? ts : (states[profile]?.lastCheck || 0), nextAt: ts + (summary.ok || summary.followed || summary.unfollowed ? 180000 : 30000), error: summary.error || '' }
+    store.set('followbackStates', states)
+    if (summary.ok) store.set('followbackLastCheck', ts)
+    store.set('followbackLastSummary', { ...summary, ts })
+    mainWindow?.webContents.send('followback:stateChanged')
+    mainWindow?.webContents.send('followback:tick', summary.ok ? ts : 0, { ...summary, ts })
+  })
+  ipcMain.handle('followback:toggle', async () => {
+    const revision = ++followToggleRevision, epoch = utilityEpoch
+    const v = !store.get('followBackEnabled')
+    if (v) {
+      const auth = await getFeatureAuth(true)
+      if (!auth.authenticated || epoch !== utilityEpoch || revision !== followToggleRevision) return false
+    }
+    store.set('followBackEnabled', v)
+    if (v) {
+      store.set('followbackStates', {})
+      for (const view of views.values()) view.webContents.executeJavaScript('window.__animeonFollowback?.wake()').catch(() => {})
+    }
+    mainWindow?.webContents.send('followback:stateChanged')
+    return v
   })
   // Детектор сообщает о замеченной аномалии: только уведомляем (звук + тост
   // + журнал в рендерере). Кулдаун против дублей с разных вкладок.
   let lastAnomalyNotify = 0
   ipcMain.handle('anomaly:detected', (_e, info: unknown) => {
+    if (!(store.get('detector') as any)?.watching) return false
     const now = Date.now()
     if (now - lastAnomalyNotify < 30000) return false
     lastAnomalyNotify = now
@@ -1053,7 +1346,7 @@ function createMainWindow() {
     let wantToast = true
     try {
       const dd: any = (store as any).get('detector') || {}
-      wantToast = dd.toast !== false
+      wantToast = dd.sound !== false
     } catch {}
     mainWindow?.webContents.send('anomaly:detected', { ...((info as any) || {}), toast: wantToast })
     // Тост дублируем внутрь активной вкладки: App-тост висит в зоне
@@ -1106,14 +1399,26 @@ function createMainWindow() {
 // the previous session. Stale leadership is cleared too, otherwise the new
 // instance would lose the claim to its own dead predecessor (TTL shadow).
 function resetRunFlags() {
+  cancelCollections()
+  authCache = null; detectorToggleRevision++; followToggleRevision++
+  mainWindow?.webContents.send('journal:clear')
+  ;(store as any).delete('followbackLastSummary')
   try { (store as any).delete('followbackLastCheck'); (store as any).delete('followbackOwner') } catch {}
-  // Счётчик детектора обнуляется на старте, тумблеры (наблюдение/звук/окно) живут дальше.
+  store.set('followBackEnabled', false)
+  store.set('followbackStates', {})
+  // Run-only switches reset; sound, whitelist and profile preferences remain saved.
   try {
     const d: any = (store as any).get('detector') || {}
-    d.count = 0; d.lastAt = 0
+    d.watching = false; d.autoCollect = false; d.count = 0; d.lastAt = 0
     ;(store as any).set('detector', d)
   } catch {}
 }
+
+// Detect logout even while the Functions screen is closed.
+const authWatchTimer = setInterval(() => {
+  if ((store.get('detector') as any)?.watching || store.get('followBackEnabled')) void getFeatureAuth(true)
+}, 15000)
+authWatchTimer.unref()
 
 const singleInstanceLock = app.requestSingleInstanceLock()
 if (!singleInstanceLock) {
@@ -1142,7 +1447,7 @@ if (!singleInstanceLock) {
     const pinnedTabs = savedTabs.filter(t => t.pinned).slice(0, 5).map(t => ({ ...t, audible: false }))
     const startupAccount = String(store.get('activeAccountId') || '1')
     const tabsAtLaunch = pinnedTabs.length ? pinnedTabs : [
-      { id: `startup-${Date.now()}`, url: store.get('baseUrl') as string, title: 'Animeon — старт', partition: `persist:animeon-acc-${startupAccount}`, pinned: false, muted: false },
+      { id: `startup-${Date.now()}`, url: store.get('baseUrl') as string, title: 'AnimeOn — старт', partition: `persist:animeon-acc-${startupAccount}`, pinned: false, muted: false },
     ]
     const launchId = tabsAtLaunch[0]?.id
     store.set('tabs', tabsAtLaunch)
@@ -1162,39 +1467,6 @@ if (!singleInstanceLock) {
     const isGoogleOrTelegram = (url: string) =>
       url.includes('google.com') || url.includes('google.') ||
       url.includes('telegram.org') || url.includes('t.me')
-
-    const importChromeGoogleCookies = async (partition: string) => {
-      try {
-        const chromeCookiesPath = path.join(app.getPath('appData').replace(/Roaming$/, 'Local'), 'Google', 'Chrome', 'User Data', 'Default', 'Network', 'Cookies')
-        try { fs.accessSync(chromeCookiesPath, fs.constants.R_OK) } catch { return }
-        const { getCookies } = require('chrome-cookies-secure') as any
-        const ses = session.fromPartition(partition)
-        for (const host of ['https://accounts.google.com', 'https://google.com', 'https://.google.com']) {
-          try {
-            const cookies: any[] = await new Promise((res, rej) => {
-              getCookies(host, 'Chrome', (err: any, cookies: any) => err ? rej(err) : res(cookies || []))
-            })
-            for (const c of cookies.slice(0, 20)) {
-              try {
-                await ses.cookies.set({
-                  url: host,
-                  name: c.name,
-                  value: c.value,
-                  domain: c.domain,
-                  path: c.path || '/',
-                  secure: !!c.secure,
-                  httpOnly: !!c.httpOnly,
-                  expirationDate: c.expires ? Math.floor(c.expires) : undefined
-                })
-              } catch {}
-            }
-            if (cookies.length) break
-          } catch (e: any) {
-            if (String(e?.message).includes('SQLITE_CANTOPEN')) return
-          }
-        }
-      } catch {}
-    }
 
     const routeSet = new Set<number>()
     const loadCallbackIntoTab = (contents: Electron.WebContents, ev?: Electron.Event) => {
@@ -1238,6 +1510,7 @@ if (!singleInstanceLock) {
     }
 
     const openOAuthWindow = async (url: string) => {
+      if (profileSwitchBusy) return
       const now = Date.now()
       debugLog('openOAuthWindow called with', safeUrl(url))
       if (now - lastOAuthWindowTime < 2000) { debugLog('cooldown skip'); return }
@@ -1245,9 +1518,6 @@ if (!singleInstanceLock) {
       try {
         const activeAcc = store.get('activeAccountId') as string | null
         const partition = activeAcc ? `persist:animeon-acc-${activeAcc}` : 'persist:animeon-acc-1'
-        if (url.includes('google')) {
-          try { await importChromeGoogleCookies(partition) } catch {}
-        }
         const ses = session.fromPartition(partition)
         // The OAuth popup uses the account partition too. Capture GIS's
         // credential response there, since it must never navigate the tab.
@@ -1278,17 +1548,10 @@ if (!singleInstanceLock) {
           title: url.includes('google') ? 'Google — вход' : 'Telegram — вход',
           webPreferences: {
             session: ses,
-            // oauth.js, а не hidden.js: глушит WebAuthn/passkey до скриптов
-            // страницы, чтобы Windows не показывал системный диалог ключей.
-            // contextIsolation ВЫКЛЮЧЕН осознанно: с изоляцией preload правит
-            // копию navigator в своём мире, а страница видит нативный объект —
-            // заглушка не работала (видно в логе: stub null, get native).
-            // nodeIntegration остаётся выключен: секретов в preload нет,
-            // странице доступен только сам стаб.
-            preload: getPreloadPath('oauth.js'),
-            contextIsolation: false,
+            // Leave WebAuthn and credentials APIs untouched in the login window.
+            contextIsolation: true,
             nodeIntegration: false,
-            sandbox: false
+            sandbox: true
           }
         })
         oauthWindows.add(oauthWin)
@@ -1313,12 +1576,6 @@ if (!singleInstanceLock) {
         } catch (e: any) { debugLog('cdp attach failed=', e?.message) }
         routeOAuthCallback(oauthWin.webContents)
         oauthWin.loadURL(url)
-        // Диагностика заглушки passkey: что реально видит страница.
-        try {
-          oauthWin.webContents.once('dom-ready', () => {
-            oauthWin.webContents.executeJavaScript(`(()=>{try{const c=navigator.credentials;return {stub:window.__oauthStub||null,pkc:typeof PublicKeyCredential,getSrc:String(c&&c.get).slice(0,90),wd:String(navigator.webdriver),ua:navigator.userAgent.slice(-30)}}catch(e){return {err:String(e).slice(0,80)}}})()`).then((r: any) => debugLog('oauth stub check:', JSON.stringify(r))).catch(() => {})
-          })
-        } catch {}
         oauthWin.webContents.on('did-finish-load', () => {
           oauthWin.webContents.insertCSS('::-webkit-scrollbar { display: none !important; }').catch(() => {})
         })
@@ -1337,6 +1594,14 @@ if (!singleInstanceLock) {
         debugLog('main:window-open', url.split('?')[0], 'current=', contents.getURL().split('?')[0], 'isOAuth=', isOAuth(url))
         if (url.startsWith('about:') || url.startsWith('tg://')) return { action: 'allow' }
         const currentUrl = contents.getURL()
+
+        // Native popup preserves window.opener/postMessage and the originating session.
+        let googlePopup = false
+        try { const parsed = new URL(url); googlePopup = parsed.protocol === 'https:' && ['accounts.google.com', 'consent.google.com'].includes(parsed.hostname) } catch {}
+        if (googlePopup && (normalizeAnimeonUrl(currentUrl) || popupContents.has(contents.id))) {
+          if (profileSwitchBusy) return { action: 'deny' }
+          return { action: 'allow', overrideBrowserWindowOptions: { width: 500, height: 620, autoHideMenuBar: true, webPreferences: { session: contents.session, preload: getPreloadPath('oauth.js'), contextIsolation: true, nodeIntegration: false, sandbox: true } } }
+        }
 
         // Google Identity Services uses a POPUP that returns the token via
         // window.opener.postMessage from /gsi/transform. We MUST let it open
@@ -1390,7 +1655,16 @@ if (!singleInstanceLock) {
         }
       })
 
-      contents.on('did-create-window', (win) => {
+      contents.on('did-create-window', (win, details) => {
+        try {
+          if (['accounts.google.com', 'consent.google.com'].includes(new URL(details.url).hostname)) {
+            popupContents.add(win.webContents.id)
+            oauthWindows.add(win)
+            const popupId = win.webContents.id
+            win.on('closed', () => { popupContents.delete(popupId); oauthWindows.delete(win) })
+            return
+          }
+        } catch {}
         const url = win.webContents.getURL()
         debugLog('main:did-create-window url=', url.split('?')[0])
         popupContents.add(win.webContents.id)
@@ -1435,6 +1709,7 @@ if (!singleInstanceLock) {
 
 app.on('window-all-closed', () => app.quit())
 app.on('before-quit', () => {
+  if (!singleInstanceLock) return
   resetRunFlags()
   const tabs: any[] = (store.get('tabs') as any[]) || []
   const pinned = tabs.filter(t => t.pinned)
@@ -1451,7 +1726,7 @@ app.on('before-quit', () => {
 setTimeout(() => {
   try {
     const { autoUpdater } = require('electron-updater')
-    autoUpdater.autoDownload = true
-    autoUpdater.checkForUpdatesAndNotify().catch(() => {})
+    // Test channel must never download or install the stable release automatically.
+    autoUpdater.autoDownload = false
   } catch {}
 }, 20000)

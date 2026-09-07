@@ -2,7 +2,6 @@
 // @name         AnimeOn XP Monitor
 // @namespace    https://animeon.cc/
 // @version      2.1.0
-// @author       Suchka322
 // @description  Плавающий монитор XP AnimeOn с зелёным прогрессом до следующей круглой тысячи.
 // @match        https://animeon.cc/*
 // @match        https://www.animeon.cc/*
@@ -15,12 +14,6 @@
 
 (() => {
     'use strict';
-    window.__ANIMEON_XP_MONITOR__?.stop?.();
-    const TARGET_USER = 'username';
-    const listeners = new AbortController();
-    let stopped = false;
-    let requestController = null;
-    let pollTimer = null;
 
     const POLL_MS = 1000;
     const ROUND_STEP = 1000;
@@ -295,9 +288,10 @@
             <div id="aoxp-compact-progress-wrap"><div id="aoxp-compact-progress"></div></div>
         </div>
         <div id="aoxp-body">
+            <input id="aoxp-input" type="text" autocomplete="off" spellcheck="false" placeholder="Ник пользователя → Enter">
             <div id="aoxp-status">
                 <span id="aoxp-dot"></span>
-                <span id="aoxp-status-text">Определяем аккаунт…</span>
+                <span id="aoxp-status-text">Введите ник и нажмите Enter</span>
             </div>
             <div id="aoxp-grid">
                 <div class="aoxp-card">
@@ -323,7 +317,6 @@
             </div>
             <div id="aoxp-progress-wrap"><div id="aoxp-progress"></div></div>
             <div id="aoxp-delta"></div>
-            <div style="margin-top:8px;text-align:right;font-size:10px;color:#92929e">by Suchka322</div>
         </div>
     `;
     document.body.appendChild(panel);
@@ -340,6 +333,7 @@
     const header = panel.querySelector('#aoxp-header');
     const minimize = panel.querySelector('#aoxp-minimize');
     const title = panel.querySelector('#aoxp-title');
+    const input = panel.querySelector('#aoxp-input');
     const status = panel.querySelector('#aoxp-status');
     const statusText = panel.querySelector('#aoxp-status-text');
     const currentEl = panel.querySelector('#aoxp-current');
@@ -475,23 +469,18 @@
 
     function extractXp(data) {
         const user = data?.user && typeof data.user === 'object' ? data.user : data;
-        const rawXp = user?.total_xp;
-        if (rawXp === null || rawXp === undefined || rawXp === '') return null;
-        const xp = Number(rawXp);
+        const xp = Number(user?.total_xp);
         return Number.isFinite(xp) ? xp : null;
     }
 
     async function readProfile(generation = requestGeneration) {
-        if (stopped || !trackedNick || requestInFlight) return;
+        if (!trackedNick || requestInFlight) return;
 
         requestInFlight = true;
-        requestController = new AbortController();
-        const timeout = setTimeout(() => requestController?.abort(), 10000);
         try {
             const response = await fetch(
                 `/api/users/${encodeURIComponent(trackedNick)}?xp_monitor=${Date.now()}`,
                 {
-                    signal: requestController.signal,
                     credentials: 'include',
                     cache: 'no-store',
                     headers: { Accept: 'application/json' }
@@ -521,14 +510,12 @@
                 setStatus('error', 'Нет ответа от сайта');
             }
         } finally {
-            clearTimeout(timeout);
             requestInFlight = false;
         }
     }
 
     function resetForNick(nick) {
         requestGeneration += 1;
-        requestController?.abort();
         trackedNick = nick;
         startXp = null;
         lastXp = null;
@@ -548,6 +535,17 @@
         setStatus('wait', `Получаю XP: ${trackedNick}…`);
         readProfile(requestGeneration);
     }
+
+    input.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter') return;
+        const nick = input.value.trim().replace(/^@/, '');
+        if (!nick) {
+            setStatus('error', 'Введите ник пользователя');
+            return;
+        }
+        input.blur();
+        resetForNick(nick);
+    });
 
     minimize.addEventListener('mousedown', (event) => event.stopPropagation());
     minimize.addEventListener('click', (event) => {
@@ -585,11 +583,11 @@
         panel.style.top = `${top}px`;
         panel.style.right = 'auto';
         panel.style.bottom = 'auto';
-    }, { signal: listeners.signal });
+    });
 
     window.addEventListener('mouseup', () => {
         dragging = false;
-    }, { signal: listeners.signal });
+    });
 
     window.addEventListener('resize', () => {
         const rect = panel.getBoundingClientRect();
@@ -597,19 +595,7 @@
         const maxTop = Math.max(0, window.innerHeight - panel.offsetHeight);
         panel.style.left = `${Math.min(maxLeft, Math.max(0, rect.left))}px`;
         panel.style.top = `${Math.min(maxTop, Math.max(0, rect.top))}px`;
-    }, { signal: listeners.signal });
+    });
 
-    window.__ANIMEON_XP_MONITOR__ = {
-        stop() {
-            stopped = true; requestGeneration++;
-            requestController?.abort(); listeners.abort();
-            clearInterval(pollTimer); clearTimeout(reachedTimer);
-            panel.remove(); banner.remove(); style.remove();
-            delete window.__ANIMEON_XP_MONITOR__;
-        }
-    };
-    pollTimer = setInterval(() => readProfile(requestGeneration), POLL_MS);
-    if (TARGET_USER && TARGET_USER !== 'username') {
-        resetForNick(TARGET_USER);
-    }
+    setInterval(() => readProfile(requestGeneration), POLL_MS);
 })();
