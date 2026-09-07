@@ -1,78 +1,71 @@
 <p align="center">
-  <img src="https://i.ibb.co/N6tTm6X4/logo.png" width="160" alt="Animeon Desktop">
+  <img src="https://i.ibb.co/N6tTm6X4/logo.png" width="160" alt="AnimeOn Desktop">
 </p>
-
-<h1 align="center">Animeon Desktop</h1>
-
+<h1 align="center">AnimeOn Desktop</h1>
+<p align="center">Неофициальный десктоп-клиент для <a href="https://animeon.cc">AnimeOn</a>.<br>Сайт, профили и полезные функции — в одном окне.</p>
 <p align="center">
-  Неофициальный Windows-клиент для <a href="https://animeon.cc">Animeon</a> со вкладками, отдельными профилями и встроенными помощниками.
+  <img src="https://img.shields.io/badge/version-0.4.0-bba7ec" alt="0.4.0">
+  <img src="https://img.shields.io/badge/Windows-x64-0078D4" alt="Windows x64">
+  <img src="https://img.shields.io/badge/license-MIT-90d4bc" alt="MIT">
 </p>
 
-<p align="center">
-  <a href="https://github.com/Kotecy/Animeon-Desktop/releases"><img src="https://img.shields.io/badge/version-0.3.14-violet" alt="version 0.3.14"></a>
-  <img src="https://img.shields.io/badge/platform-Windows%2011-blue" alt="Windows 11">
-  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license">
-</p>
+## ✨ Возможности
 
-## Возможности
+- 🗂️ До пяти вкладок: плавная перестановка, закрепление, отключение звука и индикатор воспроизведения.
+- 👥 Четыре изолированных профиля. Переключение всех вкладок включено по умолчанию; его можно отключить.
+- 📡 Детектор аномалий: уведомления, тихий звук, журнал и остаток на сегодня. «Звук: выкл» отключает также тосты.
+- 🤝 Взаимная автоподписка и отписка от невзаимных подписок. Белый список защищает от отписки; чёрный игнорирует входящие заявки, не удаляя их. Списки отдельные для каждого профиля.
+- 📈 XP Монитор: следит за вашим количеством опыта `полезно для выполения секретки «ноль в ноль»`.
+- 🏆 Секретки: синхронизация достижений, поиск и инструкции.
+- 🔄 Проверка обновлений из настроек, компактная история изменений.
 
-- До пяти вкладок Animeon с закреплением, отключением звука и прокруткой колесом мыши.
-- До пяти независимых профилей с отдельными авторизованными сессиями.
-- Детектор аномалий со звуком и уведомлением.
-- Взаимная автоподписка на новых подписчиков.
-- XP Monitor с автоматическим определением аккаунта, точными XP и уровнем.
-- Каталог секреток с синхронизацией, фильтрами и инструкциями по наведению на `?`.
-- Проверка новых версий через GitHub Releases.
+## 🖼️ Скриншоты
 
-## Временные инструменты
-- NyaLogger ищущий коды NYA-*** формата.
-- Декодер Морзе для задания на странице `/2501`.
+| Главная | Функции | Секретки | Настройки |
+|:--:|:--:|:--:|:--:|
+| <a href="https://ibb.co/CK7Pm0g7"><img src="https://i.ibb.co/5h8KGcm8/image.png" width="200" alt="Главная"></a> | <a href="https://ibb.co/N2nT7sQq"><img src="https://i.ibb.co/r2fdvmTh/image.png" width="200" alt="Функции"></a> | <a href="https://ibb.co/ds7Bj4LM"><img src="https://i.ibb.co/9mGncHVg/image.png" width="200" alt="Секретки"></a> | <a href="https://ibb.co/Pvkk6K4s"><img src="https://i.ibb.co/0R55GTZp/image.png" width="200" alt="Настройки"></a> |
 
-## Скриншоты
+Скриншоты актуальны для версии 0.4.0.
 
-| Главная | Полезные функции | Прогресс секреток | Настройки |
-|---|---|---|---|
-| <a href="https://i.ibb.co/WpjsNLSv/image.png"><img src="https://i.ibb.co/WpjsNLSv/image.png" width="200" alt="Главная"></a> | <a href="https://i.ibb.co/KpKc0fMG/image.png"><img src="https://i.ibb.co/KpKc0fMG/image.png" width="200" alt="Полезные функции"></a> | <a href="https://i.ibb.co/C500NX6c/image.png"><img src="https://i.ibb.co/C500NX6c/image.png" width="200" alt="Прогресс секреток"></a> | <a href="https://i.ibb.co/TBCfcDBd/image.png"><img src="https://i.ibb.co/TBCfcDBd/image.png" width="200" alt="Настройки"></a> |
+## 📦 Установка
 
-## Установка
+1. Скачайте **AnimeOn Desktop.exe** из [Releases](https://github.com/Kotecy/Animeon-Desktop/releases).
+2. Запустите файл. Установка не требуется.
+3. Войдите в AnimeOn и включите нужные функции.
 
-1. Скачайте `AnimeonDesktop.exe` на странице [Releases](https://github.com/Kotecy/Animeon-Desktop/releases).
-2. Запустите файл — установка не требуется.
+Данные приложения находятся в `%LOCALAPPDATA%\AnimeonDesktop`.
+Обновление не очищает их автоматически. Только при проблемах и по желанию можно закрыть приложение и удалить эту папку для чистого старта. **Это сбросит настройки и все входы в аккаунты.** Сохраните резервную копию, если хотите иметь возможность вернуть данные. Это полный сброс, а не очистка только кэша.
 
-Настройки и сессии сохраняются в `%LOCALAPPDATA%\AnimeonDesktop`.
-
-## Управление
-
-- Колесо мыши над вкладками — горизонтальная прокрутка списка.
-- Средняя кнопка мыши по вкладке — закрыть вкладку.
-- `F5` — перезагрузить открытую страницу.
-- `F12` — открыть или закрыть DevTools.
-- Адресная строка принимает только `animeon.cc`, `animeon.co`, `v1.animeon.co` и `v2.animeon.co`.
+Google может отклонять вход во встроенном браузере. Клиент не гарантирует устранение этого ограничения; можно воспользоваться другим доступным на сайте способом входа.
 
 <details>
-<summary><b>Сборка из исходников</b></summary>
+<summary>🛠️ Сборка из исходников</summary>
 
-Требуются Node.js 20+ и npm.
+Для сборки Windows EXE нужен Node.js 20+ и npm.
 
 ```powershell
 npm ci
 npm run build
 ```
 
-Portable-сборка появится в `release\AnimeonDesktop.exe`.
+Результат сборки будет сохранён в папке `release`.
 
-Для запуска среды разработки:
+Сборочная команда ничего не публикует автоматически.
 
-```powershell
-npm run dev
-```
+Режим разработки: `npm run dev`.
 
 </details>
 
+## 💜 Credits
+
+Приложение — [nieqq](https://v2.animeon.co/user/nieqq).
+
+Скрипты детектора и XP Монитора — [Suchka322](https://v2.animeon.co/user/Suchka322).
+
 ## ⚠️ Дисклеймер
 
-Animeon Desktop — неофициальный клиент и не связан с администрацией Animeon. Функции, выполняющие действия от имени аккаунта, используйте с учётом правил сайта.
+Клиент не связан с администрацией AnimeOn. Соблюдайте правила сайта: автоматизация действий аккаунта может быть ограничена правилами сайта.
 
-## Лицензия
+## 📄 Лицензия
 
-Проект распространяется по лицензии MIT.
+[MIT](LICENSE).
