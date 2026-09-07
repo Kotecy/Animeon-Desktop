@@ -58,8 +58,6 @@ npm run build
 
 ## 💜 Credits
 
-Приложение — [nieqq](https://v2.animeon.co/user/nieqq).
-
 Скрипты детектора и XP Монитора — [Suchka322](https://v2.animeon.co/user/Suchka322).
 
 ## ⚠️ Дисклеймер
