@@ -4,28 +4,29 @@
 <h1 align="center">AnimeOn Desktop</h1>
 <p align="center">Неофициальный десктоп-клиент для <a href="https://animeon.cc">AnimeOn</a>.<br>Сайт, профили и полезные функции — в одном окне.</p>
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.4.0-bba7ec" alt="0.4.0">
+  <img src="https://img.shields.io/badge/version-0.4.10-bba7ec" alt="0.4.10">
   <img src="https://img.shields.io/badge/Windows-x64-0078D4" alt="Windows x64">
   <img src="https://img.shields.io/badge/license-MIT-90d4bc" alt="MIT">
 </p>
 
 ## ✨ Возможности
 
-- 🗂️ До пяти вкладок: плавная перестановка, закрепление, отключение звука и индикатор воспроизведения.
+- 🏆 Секретки: синхронизация достижений, поиск и инструкции.
+- 🗂️ До семи вкладок: плавная перестановка, закрепление, отключение звука и индикатор воспроизведения.
 - 👥 Четыре изолированных профиля. Переключение всех вкладок включено по умолчанию; его можно отключить.
 - 📡 Детектор аномалий: уведомления, тихий звук, журнал и остаток на сегодня. «Звук: выкл» отключает также тосты.
 - 🤝 Взаимная автоподписка и отписка от невзаимных подписок. Белый список защищает от отписки; чёрный игнорирует входящие заявки, не удаляя их. Списки отдельные для каждого профиля.
-- 📈 XP Монитор: следит за вашим количеством опыта `полезно для выполения секретки «ноль в ноль»`.
-- 🏆 Секретки: синхронизация достижений, поиск и инструкции.
-- 🔄 Проверка обновлений из настроек, компактная история изменений.
+- 📈 Пользовательские функции: до девяти JavaScript-файлов `.js`, с отдельным переключателем, перестановкой и перетаскиванием.
+- 💾 Быстрая очистка дискового кэша страниц без сброса авторизации и сессий.
+- 🔄 Проверка обновлений из настроек.
 
 ## 🖼️ Скриншоты
 
 | Главная | Функции | Секретки | Настройки |
 |:--:|:--:|:--:|:--:|
-| <a href="https://ibb.co/CK7Pm0g7"><img src="https://i.ibb.co/5h8KGcm8/image.png" width="200" alt="Главная"></a> | <a href="https://ibb.co/N2nT7sQq"><img src="https://i.ibb.co/r2fdvmTh/image.png" width="200" alt="Функции"></a> | <a href="https://ibb.co/ds7Bj4LM"><img src="https://i.ibb.co/9mGncHVg/image.png" width="200" alt="Секретки"></a> | <a href="https://ibb.co/Pvkk6K4s"><img src="https://i.ibb.co/0R55GTZp/image.png" width="200" alt="Настройки"></a> |
+| <a href="https://i.ibb.co/5h8KGcm8/image.png" target="_blank"><img src="https://i.ibb.co/5h8KGcm8/image.png" width="200" alt="Главная"></a> | <a href="https://i.ibb.co/r2fdvmTh/image.png" target="_blank"><img src="https://i.ibb.co/r2fdvmTh/image.png" width="200" alt="Функции"></a> | <a href="https://i.ibb.co/9mGncHVg/image.png" target="_blank"><img src="https://i.ibb.co/9mGncHVg/image.png" width="200" alt="Секретки"></a> | <a href="https://i.ibb.co/0R55GTZp/image.png" target="_blank"><img src="https://i.ibb.co/0R55GTZp/image.png" width="200" alt="Настройки"></a> |
 
-Скриншоты актуальны для версии 0.4.0.
+Скриншоты актуальны для версии `0.4.0`.
 
 ## 📦 Установка
 
