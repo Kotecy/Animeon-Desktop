@@ -1,0 +1,18 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* { scrollbar-width: none; }
+*::-webkit-scrollbar { display: none; width: 0; height: 0; }
+
+html, body, #root { height: 100%; }
+body { background: transparent; overflow: hidden; }
+
+.win-btn {
+  -webkit-app-region: no-drag;
+  pointer-events: auto !important;
+}
+.win-btn:hover {
+  background: rgba(255, 255, 255, 0.1) !important;
+  color: white !important;
+}

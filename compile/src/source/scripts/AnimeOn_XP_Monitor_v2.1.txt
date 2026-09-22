@@ -1,0 +1,601 @@
+// ==UserScript==
+// @name         AnimeOn XP Monitor
+// @namespace    https://animeon.cc/
+// @version      2.1.0
+// @description  Плавающий монитор XP AnimeOn с зелёным прогрессом до следующей круглой тысячи.
+// @match        https://animeon.cc/*
+// @match        https://www.animeon.cc/*
+// @match        https://v1.animeon.co/*
+// @match        http://v2.animeon.co/*
+// @match        https://v2.animeon.co/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(() => {
+    'use strict';
+
+    const POLL_MS = 1000;
+    const ROUND_STEP = 1000;
+    const WARNING_AT = 50;
+
+    let trackedNick = '';
+    let startXp = null;
+    let lastXp = null;
+    let targetXp = null;
+    let requestInFlight = false;
+    let requestGeneration = 0;
+    let reachedTimer = null;
+
+    const fmt = (value) => Number(value).toLocaleString('ru-RU');
+
+    const style = document.createElement('style');
+    style.textContent = `
+        #aoxp-panel {
+            position: fixed;
+            top: 24px;
+            left: 24px;
+            width: 310px;
+            z-index: 2147483646;
+            color: #f4f4f5;
+            background: rgba(22, 22, 28, 0.96);
+            border: 1px solid rgba(255, 255, 255, 0.13);
+            border-radius: 14px;
+            box-shadow: 0 14px 40px rgba(0, 0, 0, 0.38);
+            overflow: hidden;
+            font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+            font-size: 13px;
+            user-select: none;
+            backdrop-filter: blur(10px);
+        }
+
+        #aoxp-panel * { box-sizing: border-box; }
+
+        #aoxp-header {
+            position: relative;
+            min-height: 42px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 9px 10px 9px 13px;
+            background: rgba(255, 255, 255, 0.045);
+            cursor: move;
+        }
+
+        #aoxp-panel.aoxp-collapsed #aoxp-header {
+            min-height: 50px;
+            padding-bottom: 15px;
+        }
+
+        #aoxp-title {
+            flex: 1;
+            min-width: 0;
+            font-weight: 700;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        #aoxp-minimize {
+            width: 27px;
+            height: 27px;
+            display: grid;
+            place-items: center;
+            padding: 0;
+            border: 0;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.08);
+            color: #fff;
+            font: 700 18px/1 Arial, sans-serif;
+            cursor: pointer;
+        }
+
+        #aoxp-minimize:hover { background: rgba(255, 255, 255, 0.14); }
+
+        #aoxp-body { padding: 12px; }
+        #aoxp-panel.aoxp-collapsed #aoxp-body { display: none; }
+        #aoxp-panel.aoxp-collapsed { width: 250px; }
+
+        #aoxp-input {
+            width: 100%;
+            height: 38px;
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            border-radius: 10px;
+            outline: none;
+            padding: 0 11px;
+            background: rgba(0, 0, 0, 0.24);
+            color: #fff;
+            font: inherit;
+            user-select: text;
+        }
+
+        #aoxp-input:focus {
+            border-color: rgba(178, 138, 255, 0.75);
+            box-shadow: 0 0 0 3px rgba(178, 138, 255, 0.12);
+        }
+
+        #aoxp-status {
+            min-height: 34px;
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            padding: 8px 2px 7px;
+            color: #a9a9b2;
+            line-height: 1.25;
+        }
+
+        #aoxp-dot {
+            width: 8px;
+            height: 8px;
+            flex: 0 0 auto;
+            border-radius: 50%;
+            background: #71717a;
+        }
+
+        #aoxp-status.aoxp-ok #aoxp-dot { background: #35d07f; box-shadow: 0 0 8px rgba(53, 208, 127, .7); }
+        #aoxp-status.aoxp-error #aoxp-dot { background: #ff6363; box-shadow: 0 0 8px rgba(255, 99, 99, .5); }
+        #aoxp-status.aoxp-wait #aoxp-dot { background: #e7b34f; }
+
+        #aoxp-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+
+        .aoxp-card {
+            min-height: 70px;
+            padding: 10px;
+            border-radius: 11px;
+            background: rgba(255, 255, 255, 0.055);
+        }
+
+        .aoxp-label {
+            margin-bottom: 5px;
+            color: #92929e;
+            font-size: 11px;
+        }
+
+        .aoxp-value {
+            font-size: 21px;
+            font-weight: 800;
+            letter-spacing: -0.3px;
+        }
+
+        #aoxp-gained { color: #57df99; }
+        #aoxp-remaining.aoxp-near { color: #ffd166; }
+
+        #aoxp-delta {
+            height: 17px;
+            margin-top: 9px;
+            text-align: center;
+            color: #8b8b96;
+            font-size: 12px;
+        }
+
+        #aoxp-progress-scale {
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+            margin-top: 10px;
+            color: #85858f;
+            font-size: 10px;
+            font-variant-numeric: tabular-nums;
+        }
+
+        #aoxp-progress-wrap {
+            height: 9px;
+            margin-top: 4px;
+            overflow: hidden;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.08);
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,.025);
+        }
+
+        #aoxp-progress {
+            width: 0;
+            height: 100%;
+            border-radius: inherit;
+            background: linear-gradient(90deg, #22b86b, #57df99);
+            box-shadow: 0 0 10px rgba(87, 223, 153, .38);
+            transition: width .22s ease;
+        }
+
+        #aoxp-compact-progress-wrap {
+            display: none;
+            position: absolute;
+            left: 12px;
+            right: 12px;
+            bottom: 6px;
+            height: 5px;
+            overflow: hidden;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.09);
+            pointer-events: none;
+        }
+
+        #aoxp-compact-progress {
+            width: 0;
+            height: 100%;
+            border-radius: inherit;
+            background: linear-gradient(90deg, #22b86b, #57df99);
+            box-shadow: 0 0 8px rgba(87, 223, 153, .38);
+            transition: width .22s ease;
+        }
+
+        #aoxp-panel.aoxp-collapsed #aoxp-compact-progress-wrap { display: block; }
+
+        #aoxp-banner {
+            position: fixed;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%) scale(.94);
+            z-index: 2147483647;
+            min-width: min(620px, calc(100vw - 32px));
+            max-width: calc(100vw - 32px);
+            padding: 24px 28px;
+            border-radius: 20px;
+            border: 2px solid rgba(255, 209, 102, .8);
+            background: rgba(23, 19, 10, .95);
+            box-shadow: 0 20px 80px rgba(0,0,0,.55), 0 0 40px rgba(255, 209, 102, .14);
+            color: #fff;
+            text-align: center;
+            font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+            pointer-events: none;
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity .18s ease, transform .18s ease, visibility .18s;
+        }
+
+        #aoxp-banner.aoxp-show {
+            opacity: 1;
+            visibility: visible;
+            transform: translate(-50%, -50%) scale(1);
+        }
+
+        #aoxp-banner.aoxp-reached {
+            border-color: rgba(87, 223, 153, .88);
+            background: rgba(10, 27, 20, .96);
+            box-shadow: 0 20px 80px rgba(0,0,0,.55), 0 0 44px rgba(87, 223, 153, .18);
+        }
+
+        #aoxp-banner-title {
+            margin-bottom: 8px;
+            font-size: clamp(22px, 3vw, 36px);
+            font-weight: 900;
+        }
+
+        #aoxp-banner-main {
+            font-size: clamp(38px, 6vw, 72px);
+            font-weight: 950;
+            line-height: 1;
+            letter-spacing: -1.5px;
+        }
+
+        #aoxp-banner-sub {
+            margin-top: 10px;
+            color: #cfcfcf;
+            font-size: clamp(14px, 2vw, 19px);
+        }
+    `;
+    document.documentElement.appendChild(style);
+
+    const panel = document.createElement('div');
+    panel.id = 'aoxp-panel';
+    panel.innerHTML = `
+        <div id="aoxp-header">
+            <div id="aoxp-title">XP Monitor</div>
+            <button id="aoxp-minimize" type="button" title="Свернуть">−</button>
+            <div id="aoxp-compact-progress-wrap"><div id="aoxp-compact-progress"></div></div>
+        </div>
+        <div id="aoxp-body">
+            <input id="aoxp-input" type="text" autocomplete="off" spellcheck="false" placeholder="Ник пользователя → Enter">
+            <div id="aoxp-status">
+                <span id="aoxp-dot"></span>
+                <span id="aoxp-status-text">Введите ник и нажмите Enter</span>
+            </div>
+            <div id="aoxp-grid">
+                <div class="aoxp-card">
+                    <div class="aoxp-label">Текущий XP</div>
+                    <div class="aoxp-value" id="aoxp-current">—</div>
+                </div>
+                <div class="aoxp-card">
+                    <div class="aoxp-label">Получено</div>
+                    <div class="aoxp-value" id="aoxp-gained">+0</div>
+                </div>
+                <div class="aoxp-card">
+                    <div class="aoxp-label">Следующая цель</div>
+                    <div class="aoxp-value" id="aoxp-target">—</div>
+                </div>
+                <div class="aoxp-card">
+                    <div class="aoxp-label">Осталось</div>
+                    <div class="aoxp-value" id="aoxp-remaining">—</div>
+                </div>
+            </div>
+            <div id="aoxp-progress-scale">
+                <span id="aoxp-progress-start">—</span>
+                <span id="aoxp-progress-target">—</span>
+            </div>
+            <div id="aoxp-progress-wrap"><div id="aoxp-progress"></div></div>
+            <div id="aoxp-delta"></div>
+        </div>
+    `;
+    document.body.appendChild(panel);
+
+    const banner = document.createElement('div');
+    banner.id = 'aoxp-banner';
+    banner.innerHTML = `
+        <div id="aoxp-banner-title"></div>
+        <div id="aoxp-banner-main"></div>
+        <div id="aoxp-banner-sub"></div>
+    `;
+    document.body.appendChild(banner);
+
+    const header = panel.querySelector('#aoxp-header');
+    const minimize = panel.querySelector('#aoxp-minimize');
+    const title = panel.querySelector('#aoxp-title');
+    const input = panel.querySelector('#aoxp-input');
+    const status = panel.querySelector('#aoxp-status');
+    const statusText = panel.querySelector('#aoxp-status-text');
+    const currentEl = panel.querySelector('#aoxp-current');
+    const gainedEl = panel.querySelector('#aoxp-gained');
+    const targetEl = panel.querySelector('#aoxp-target');
+    const remainingEl = panel.querySelector('#aoxp-remaining');
+    const progressEl = panel.querySelector('#aoxp-progress');
+    const compactProgressEl = panel.querySelector('#aoxp-compact-progress');
+    const progressStartEl = panel.querySelector('#aoxp-progress-start');
+    const progressTargetEl = panel.querySelector('#aoxp-progress-target');
+    const deltaEl = panel.querySelector('#aoxp-delta');
+    const bannerTitle = banner.querySelector('#aoxp-banner-title');
+    const bannerMain = banner.querySelector('#aoxp-banner-main');
+    const bannerSub = banner.querySelector('#aoxp-banner-sub');
+
+    function setStatus(kind, text) {
+        status.className = kind ? `aoxp-${kind}` : '';
+        statusText.textContent = text;
+    }
+
+    function nextRoundAbove(xp) {
+        return (Math.floor(xp / ROUND_STEP) + 1) * ROUND_STEP;
+    }
+
+    function hideBanner() {
+        banner.classList.remove('aoxp-show', 'aoxp-reached');
+    }
+
+    function showNearBanner(remaining, target) {
+        if (reachedTimer) {
+            clearTimeout(reachedTimer);
+            reachedTimer = null;
+        }
+        banner.classList.remove('aoxp-reached');
+        bannerTitle.textContent = '⚠ Скоро круглый XP';
+        bannerMain.textContent = `${fmt(remaining)} XP`;
+        bannerSub.textContent = `до ${fmt(target)}`;
+        banner.classList.add('aoxp-show');
+    }
+
+    function showReachedBanner(reachedTarget, newTarget) {
+        if (reachedTimer) clearTimeout(reachedTimer);
+        banner.classList.add('aoxp-reached', 'aoxp-show');
+        bannerTitle.textContent = '🎯 Круглый XP достигнут';
+        bannerMain.textContent = fmt(reachedTarget);
+        bannerSub.textContent = `Теперь считаем до ${fmt(newTarget)}`;
+        reachedTimer = setTimeout(() => {
+            reachedTimer = null;
+            updateWarning();
+        }, 2800);
+    }
+
+    function updateWarning() {
+        if (reachedTimer) return;
+
+        if (!Number.isFinite(lastXp) || !Number.isFinite(targetXp)) {
+            hideBanner();
+            return;
+        }
+
+        const remaining = targetXp - lastXp;
+        if (remaining > 0 && remaining <= WARNING_AT) {
+            showNearBanner(remaining, targetXp);
+        } else {
+            hideBanner();
+        }
+    }
+
+    function updateUi(delta = null) {
+        if (!Number.isFinite(lastXp)) return;
+
+        const gained = Number.isFinite(startXp) ? lastXp - startXp : 0;
+        const remaining = targetXp - lastXp;
+        const roundStart = targetXp - ROUND_STEP;
+        const withinThousand = Math.max(0, lastXp - roundStart);
+        const progress = Math.max(0, Math.min(100, (withinThousand / ROUND_STEP) * 100));
+
+        currentEl.textContent = fmt(lastXp);
+        gainedEl.textContent = `${gained >= 0 ? '+' : ''}${fmt(gained)}`;
+        targetEl.textContent = fmt(targetXp);
+        remainingEl.textContent = fmt(Math.max(0, remaining));
+        remainingEl.classList.toggle('aoxp-near', remaining > 0 && remaining <= WARNING_AT);
+        progressStartEl.textContent = fmt(roundStart);
+        progressTargetEl.textContent = fmt(targetXp);
+        progressEl.style.width = `${progress}%`;
+        compactProgressEl.style.width = `${progress}%`;
+
+        if (delta !== null && delta !== 0) {
+            deltaEl.textContent = `Последнее изменение: ${delta > 0 ? '+' : ''}${fmt(delta)} XP`;
+        }
+
+        title.textContent = panel.classList.contains('aoxp-collapsed')
+            ? `${trackedNick}: ${fmt(lastXp)} · до ${fmt(Math.max(0, remaining))}`
+            : `XP Monitor · ${trackedNick}`;
+    }
+
+    function applyXp(xp) {
+        if (!Number.isFinite(xp)) return;
+
+        const previous = lastXp;
+
+        if (startXp === null) {
+            startXp = xp;
+            lastXp = xp;
+            targetXp = nextRoundAbove(xp);
+            updateUi();
+            updateWarning();
+            return;
+        }
+
+        if (xp === lastXp) {
+            updateWarning();
+            return;
+        }
+
+        lastXp = xp;
+
+        if (!Number.isFinite(targetXp)) {
+            targetXp = nextRoundAbove(xp);
+        }
+
+        if (xp >= targetXp) {
+            const reachedTarget = targetXp;
+            targetXp = nextRoundAbove(xp);
+            updateUi(previous === null ? null : xp - previous);
+            showReachedBanner(reachedTarget, targetXp);
+            return;
+        }
+
+        updateUi(previous === null ? null : xp - previous);
+        updateWarning();
+    }
+
+    function extractXp(data) {
+        const user = data?.user && typeof data.user === 'object' ? data.user : data;
+        const xp = Number(user?.total_xp);
+        return Number.isFinite(xp) ? xp : null;
+    }
+
+    async function readProfile(generation = requestGeneration) {
+        if (!trackedNick || requestInFlight) return;
+
+        requestInFlight = true;
+        try {
+            const response = await fetch(
+                `/api/users/${encodeURIComponent(trackedNick)}?xp_monitor=${Date.now()}`,
+                {
+                    credentials: 'include',
+                    cache: 'no-store',
+                    headers: { Accept: 'application/json' }
+                }
+            );
+
+            if (generation !== requestGeneration) return;
+
+            if (!response.ok) {
+                setStatus('error', response.status === 404 ? 'Пользователь не найден' : `Ошибка API: ${response.status}`);
+                return;
+            }
+
+            const data = await response.json();
+            if (generation !== requestGeneration) return;
+
+            const xp = extractXp(data);
+            if (xp === null) {
+                setStatus('error', 'В ответе API нет total_xp');
+                return;
+            }
+
+            setStatus('ok', `Отслеживается: ${trackedNick}`);
+            applyXp(xp);
+        } catch {
+            if (generation === requestGeneration) {
+                setStatus('error', 'Нет ответа от сайта');
+            }
+        } finally {
+            requestInFlight = false;
+        }
+    }
+
+    function resetForNick(nick) {
+        requestGeneration += 1;
+        trackedNick = nick;
+        startXp = null;
+        lastXp = null;
+        targetXp = null;
+        currentEl.textContent = '—';
+        gainedEl.textContent = '+0';
+        targetEl.textContent = '—';
+        remainingEl.textContent = '—';
+        remainingEl.classList.remove('aoxp-near');
+        progressEl.style.width = '0%';
+        compactProgressEl.style.width = '0%';
+        progressStartEl.textContent = '—';
+        progressTargetEl.textContent = '—';
+        deltaEl.textContent = '';
+        title.textContent = `XP Monitor · ${trackedNick}`;
+        hideBanner();
+        setStatus('wait', `Получаю XP: ${trackedNick}…`);
+        readProfile(requestGeneration);
+    }
+
+    input.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter') return;
+        const nick = input.value.trim().replace(/^@/, '');
+        if (!nick) {
+            setStatus('error', 'Введите ник пользователя');
+            return;
+        }
+        input.blur();
+        resetForNick(nick);
+    });
+
+    minimize.addEventListener('mousedown', (event) => event.stopPropagation());
+    minimize.addEventListener('click', (event) => {
+        event.stopPropagation();
+        panel.classList.toggle('aoxp-collapsed');
+        const collapsed = panel.classList.contains('aoxp-collapsed');
+        minimize.textContent = collapsed ? '+' : '−';
+        minimize.title = collapsed ? 'Развернуть' : 'Свернуть';
+        if (Number.isFinite(lastXp)) updateUi();
+        else title.textContent = collapsed ? 'XP Monitor' : 'XP Monitor';
+    });
+
+    let dragging = false;
+    let dragOffsetX = 0;
+    let dragOffsetY = 0;
+
+    header.addEventListener('mousedown', (event) => {
+        if (event.button !== 0 || event.target === minimize) return;
+        const rect = panel.getBoundingClientRect();
+        dragging = true;
+        dragOffsetX = event.clientX - rect.left;
+        dragOffsetY = event.clientY - rect.top;
+        event.preventDefault();
+    });
+
+    window.addEventListener('mousemove', (event) => {
+        if (!dragging) return;
+
+        const maxLeft = Math.max(0, window.innerWidth - panel.offsetWidth);
+        const maxTop = Math.max(0, window.innerHeight - panel.offsetHeight);
+        const left = Math.min(maxLeft, Math.max(0, event.clientX - dragOffsetX));
+        const top = Math.min(maxTop, Math.max(0, event.clientY - dragOffsetY));
+
+        panel.style.left = `${left}px`;
+        panel.style.top = `${top}px`;
+        panel.style.right = 'auto';
+        panel.style.bottom = 'auto';
+    });
+
+    window.addEventListener('mouseup', () => {
+        dragging = false;
+    });
+
+    window.addEventListener('resize', () => {
+        const rect = panel.getBoundingClientRect();
+        const maxLeft = Math.max(0, window.innerWidth - panel.offsetWidth);
+        const maxTop = Math.max(0, window.innerHeight - panel.offsetHeight);
+        panel.style.left = `${Math.min(maxLeft, Math.max(0, rect.left))}px`;
+        panel.style.top = `${Math.min(maxTop, Math.max(0, rect.top))}px`;
+    });
+
+    setInterval(() => readProfile(requestGeneration), POLL_MS);
+})();
