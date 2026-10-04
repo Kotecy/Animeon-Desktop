@@ -10,6 +10,12 @@ const GlobeIcon = () => <svg width="18" height="18" viewBox="0 0 24 24" fill="no
 const UserIcon = () => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="8" r="3.5" /><path d="M5 20c.7-3.2 3-5 7-5s6.3 1.8 7 5" /></svg>
 const MoreIcon = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" style={{ pointerEvents: 'none', display: 'block' }}><circle cx="5" cy="12" r="2" /><circle cx="12" cy="12" r="2" /><circle cx="19" cy="12" r="2" /></svg>
 const CHANGELOG = [
+  { version: '0.4.20', date: '04.10.2026', items: [
+    'Количество слотов для пользовательских JavaScript-скриптов (.js) увеличено с 9 до 12 с поддержкой перетаскивания и горячих клавиш',
+    'Улучшен импорт скриптов: автоматическое распознавание метаданных и описаний, расширен лимит размера файла до 300 КБ',
+    'Обновлен локальный список секреток и подсказок к ним',
+    'Повышена общая стабильность и производительность приложения'
+  ] },
   { version: '0.4.10', date: '22.09.2026', items: [
     'Добавлена возможность загрузки собственных JavaScript-скриптов (.js) — до 9 слотов с отдельными переключателями, поиском через Ctrl+K, перестановкой перетаскиванием и удалением',
     'Полоса вкладок получила иконки сайтов, отображение звука, контекстные меню и поддержку до семи вкладок',
@@ -54,7 +60,7 @@ export default function Settings({ baseUrl, onBaseUrl }) {
     window.addEventListener('keydown', onKey)
     return () => { window.removeEventListener('keydown', onKey); clearTimeout(hideTimer) }
   }, [])
-  const [version, setVersion] = useState('0.4.10')
+  const [version, setVersion] = useState('0.4.20')
   const [profileBusy, setProfileBusy] = useState(false)
   const [openProfileMenu, setOpenProfileMenu] = useState(null)
   useEffect(() => {
@@ -96,7 +102,7 @@ export default function Settings({ baseUrl, onBaseUrl }) {
       setCacheBusy(false)
     }
   }
-  const [expandedLog, setExpandedLog] = useState('22.09.2026')
+  const [expandedLog, setExpandedLog] = useState(CHANGELOG[0]?.date || '04.10.2026')
   const [showChangelog, setShowChangelog] = useState(false)
   const changelogDialog = useRef(null)
   useEffect(() => {
@@ -313,7 +319,7 @@ export default function Settings({ baseUrl, onBaseUrl }) {
           <button
             type="button"
             className="signal-history-open"
-            onClick={() => { setExpandedLog('22.09.2026'); setShowChangelog(true) }}
+            onClick={() => { setExpandedLog(CHANGELOG[0]?.date || '04.10.2026'); setShowChangelog(true) }}
           >
             История изменений
           </button>
