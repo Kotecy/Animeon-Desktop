@@ -22,7 +22,7 @@
 
 | Главная | Функции | Секретки | Настройки |
 |:--:|:--:|:--:|:--:|
-| <a href="https://i.ibb.co/Z6XpF38q/image.png" target="_blank"><img src="https://i.ibb.co/Z6XpF38q/image.png" width="200" alt="Главная"></a> | <a href="https://i.ibb.co/FLMnM5S2/image.png" target="_blank"><img src="https://i.ibb.co/FLMnM5S2/image.png" width="200" alt="Функции"></a> | <a href="https://i.ibb.co/7xsYzpwd/image.png" target="_blank"><img src="https://i.ibb.co/7xsYzpwd/image.png" width="200" alt="Секретки"></a> | <a href="https://i.ibb.co/JF2dLkGW/image.png" target="_blank"><img src="https://i.ibb.co/JF2dLkGW/image.png" width="200" alt="Настройки"></a> |
+| <a href="https://i.ibb.co/Z6XpF38q/image.png" target="_blank"><img src="https://i.ibb.co/Z6XpF38q/image.png" width="200" alt="Главная"></a> | <a href="https://i.ibb.co/FLMnM5S2/image.png" target="_blank"><img src="https://i.ibb.co/FLMnM5S2/image.png" width="200" alt="Функции"></a> | <a href="https://i.ibb.co/7xsYzpwd/image.png" target="_blank"><img src="https://i.ibb.co/7xsYzpwd/image.png" width="200" alt="Секретки"></a> | <a href="https://i.ibb.co/kVTzj1y1/image.png" target="_blank"><img src="https://i.ibb.co/kVTzj1y1/image.png" width="200" alt="Настройки"></a> |
 
 Скриншоты актуальны для версии `0.4.20`.
 
