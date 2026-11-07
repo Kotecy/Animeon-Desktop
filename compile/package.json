@@ -42,6 +42,9 @@
       "icon": "build/icon.png",
       "artifactName": "AnimeOn Desktop.exe"
     },
+    "portable": {
+      "unpackDirName": true
+    },
     "directories": {
       "buildResources": "build",
       "output": "release"
