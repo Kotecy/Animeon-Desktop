@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url'
 import Store from 'electron-store'
 import { AUTO_COLLECT_AVAILABLE } from '../shared/buildFlags'
 import { getTabOrder, moveTab, sameTabOrder } from '../shared/tabOrder'
+import { relocatePortableLauncher } from './portableLauncher'
 
 try { nativeTheme.themeSource = 'dark' } catch {}
 
@@ -2041,7 +2042,15 @@ if (!singleInstanceLock) {
     }
   })
 
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
+    try {
+      if (await relocatePortableLauncher()) {
+        app.exit(0)
+        return
+      }
+    } catch (error) {
+      debugLog('Portable launcher relocation failed:', String(error))
+    }
     // После системного сна Chromium возобновляет таймеры не одновременно.
     // Просим каждый живой view немедленно перепроверить аномалию, не создавая
     // новый цикл polling и не перезагружая страницу пользователя.
