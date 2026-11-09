@@ -6,6 +6,8 @@ const esbuild = require('esbuild')
 
 async function main() {
   const root = path.resolve(__dirname, '..')
+  const { version } = JSON.parse(fs.readFileSync(path.join(root, 'package.json')))
+  const displayedVersion = RegExp.escape(version)
   const result = await esbuild.build({
     stdin: { contents: `import React from 'react'; import { renderToString } from 'react-dom/server';
       import App from './src/renderer/App.jsx'; import Settings from './src/renderer/pages/Settings.jsx';
@@ -28,8 +30,8 @@ async function main() {
   assert.equal((compiled.exports.soundTabs.match(/class="tab-audio"/g) || []).length, 3)
   assert.doesNotMatch(compiled.exports.soundTabs, /domain-dot/)
   assert.match(pages.app, /МСК/)
-  assert.match(pages.app, /V(?:<!-- -->)?0\.5\.0/)
-  assert.match(pages.settings, /0\.5\.0/)
+  assert.match(pages.app, new RegExp(`V(?:<!-- -->)?${displayedVersion}`))
+  assert.match(pages.settings, new RegExp(`v(?:<!-- -->)?${displayedVersion}`))
   assert.match(pages.settings, /Настройки/)
   assert.match(pages.settings, /Добавить профиль/)
   assert.match(pages.dashboard, /Пользовательские/)
@@ -44,8 +46,9 @@ async function main() {
   assert.doesNotMatch(mainSource + bridge, /nya-logger|morse-decoder|utilitiesRunMorse|__NYA_LOGGER__/)
   assert.match(mainSource, /'AnimeonDesktop'/)
   assert.match(mainSource, /remaining_today >= 0/)
-  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'package.json'))).version, '0.5.0')
-  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'))).version, '0.5.0')
+  const lock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json')))
+  assert.equal(lock.version, version)
+  assert.equal(lock.packages[''].version, version)
   console.log('PASS: four React screens render; release data path, version, remaining=0 and removed utilities verified.')
 }
 main().catch(error => { console.error(error); process.exitCode = 1 })

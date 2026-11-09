@@ -184,6 +184,7 @@ function waitForCollection(): Promise<boolean> {
 
 let lastLimitInject = 0
 const ALLOWED_ANIMEON_HOSTS = new Set(['animeon.cc', 'animeon.co', 'v1.animeon.co', 'v2.animeon.co'])
+const ANIMEON_TELEGRAM_CHANNEL = 'https://t.me/animeon'
 
 function normalizeAnimeonUrl(raw: unknown): string | null {
   const value = String(raw || '').trim()
@@ -1184,6 +1185,10 @@ function registerIpcHandlers() {
     const url = normalizeAnimeonUrl(frame.url)
     return url !== null && frame.origin === new URL(url).origin
   }
+  electronIpcMain.on('site:open-telegram-channel', event => {
+    if (!isSiteRenderer(event) || event.sender !== views.get(activeTabId ?? '')?.webContents) return
+    void shell.openExternal(ANIMEON_TELEGRAM_CHANNEL).catch(() => {})
+  })
   // These channels back the compatibility API in hidden.ts. The rest
   // are commands for the local application renderer.
   const siteChannels = new Set([
@@ -2186,6 +2191,8 @@ if (!singleInstanceLock) {
     app.on('web-contents-created', (_e, contents) => {
       contents.setWindowOpenHandler(({ url }) => {
         debugLog('main:window-open', url.split('?')[0], 'current=', contents.getURL().split('?')[0], 'isOAuth=', isOAuth(url))
+        // A channel link is opened by the trusted click handler in the site preload.
+        if (/^https?:\/\/t\.me\/(?:s\/)?animeon\/?(?:[?#]|$)/i.test(url)) return { action: 'deny' }
         if (url.startsWith('about:') || url.startsWith('tg://')) return { action: 'allow' }
         const currentUrl = contents.getURL()
 

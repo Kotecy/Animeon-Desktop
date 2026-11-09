@@ -1,5 +1,15 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
+function openTelegramChannel(event: MouseEvent) {
+  if (!event.isTrusted || event.button > 1) return
+  const link = event.composedPath().find(node => node instanceof HTMLAnchorElement)
+  if (!(link instanceof HTMLAnchorElement) || !/^https?:\/\/t\.me\/(?:s\/)?animeon\/?(?:[?#]|$)/i.test(link.href)) return
+  event.preventDefault()
+  ipcRenderer.send('site:open-telegram-channel')
+}
+window.addEventListener('click', openTelegramChannel, true)
+window.addEventListener('auxclick', openTelegramChannel, true)
+
 // Anti-AFK: hidden tabs pretend to stay visible so site timers keep running.
 try {
   Object.defineProperty(document, 'hidden', { get: () => false, configurable: true })

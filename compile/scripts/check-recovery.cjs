@@ -62,6 +62,34 @@ async function run() {
     assert.ok(await waitFor(async () => !(await measure()).minimized))
     assert.deepEqual((await measure()).views.map(view => view.id), priorIds)
 
+    await instance.evaluate(({ shell }) => {
+      globalThis.auditExternalUrls = []
+      shell.openExternal = async url => { globalThis.auditExternalUrls.push(url) }
+    })
+    await getView(0, `(() => {
+      window.open('https://t.me/animeon')
+      const link = document.createElement('a')
+      link.href = 'https://t.me/animeon'
+      link.target = '_blank'
+      link.textContent = 'Telegram channel'
+      link.style.cssText = 'position:fixed;top:0;left:0;z-index:9999;width:100px;height:30px'
+      document.body.append(link)
+      link.click()
+    })()`)
+    assert.equal(await instance.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length), 1,
+      'Programmatic channel requests must not create a window')
+    assert.deepEqual(await instance.evaluate(() => globalThis.auditExternalUrls), [])
+    await instance.evaluate(async ({ BrowserWindow }) => {
+      const site = BrowserWindow.getAllWindows()[0].getBrowserViews()[0].webContents
+      site.debugger.attach('1.3')
+      try {
+        await site.debugger.sendCommand('Input.dispatchMouseEvent', { type: 'mousePressed', x: 15, y: 15, button: 'left', clickCount: 1 })
+        await site.debugger.sendCommand('Input.dispatchMouseEvent', { type: 'mouseReleased', x: 15, y: 15, button: 'left', clickCount: 1 })
+      } finally { site.debugger.detach() }
+    })
+    assert.ok(await waitFor(() => instance.evaluate(() => globalThis.auditExternalUrls.length > 0)))
+    assert.deepEqual(await instance.evaluate(() => globalThis.auditExternalUrls), ['https://t.me/animeon'])
+
     await getView(0, 'window.auditTelegramPending = true; window.open("https://t.me/animeon_fixture_bot"); true')
     assert.ok(await waitFor(() => instance.evaluate(({BrowserWindow}) =>
       BrowserWindow.getAllWindows().some(window => window.webContents.getURL().startsWith('https://t.me/')))))
