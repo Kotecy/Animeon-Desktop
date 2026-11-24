@@ -71,6 +71,16 @@ function checkSanitizer() {
   // Снять «условия уточняются» можно правкой файла на GitHub
   const flagged = { ...base, secrets: [{ ...base.secrets[0], unconfirmed: true }] }
   assert.equal(catalog.mergeSecretsCatalogs(flagged, { ...newer, secrets: [{ key: 'x', code: 'secret_x', name: 'Икс', desc: 'проверено' }] }).secrets[0].unconfirmed, undefined)
+  // Разные тире/минусы и ё/е считаются одним названием при санитизации и слиянии
+  assert.equal(catalog.normalizeSecretName('Опенинг - святое'), catalog.normalizeSecretName('Опенинг — святое'))
+  assert.equal(catalog.normalizeSecretName('1000-7'), catalog.normalizeSecretName('1000 − 7'))
+  assert.equal(catalog.normalizeSecretName('Ушёл за чаем'), catalog.normalizeSecretName('Ушел за чаем'))
+  const dashBase = { schema: 1, updated: '2026-11-21', hidden: [], secrets: [{ key: 'name:опенинг - святое', code: null, name: 'Опенинг - святое', desc: 'черновик' }] }
+  const dashFresh = { schema: 1, updated: '2026-11-25', hidden: [], secrets: [{ key: 'secret_opening_sacred', code: 'secret_opening_sacred', name: 'Опенинг — святое', desc: 'актуально', icon: 'gi:old-microphone', trophies: 300, animon: 0 }] }
+  const dashMerged = catalog.mergeSecretsCatalogs(dashBase, dashFresh)
+  assert.equal(dashMerged.secrets.length, 1, 'записи с дефисом и длинным тире сливаются без дубля')
+  assert.deepEqual([dashMerged.secrets[0].code, dashMerged.secrets[0].name, dashMerged.secrets[0].icon], ['secret_opening_sacred', 'Опенинг — святое', 'gi:old-microphone'])
+  assert.equal(catalog.sanitizeSecretsCatalog({ schema: 1, secrets: [{ name: 'Опенинг - святое', desc: 'a' }, { name: 'Опенинг — святое', desc: 'b' }] }).secrets.length, 1)
 }
 
 const configFile = dir => {
@@ -125,6 +135,8 @@ async function run() {
     assert.equal(await app.page.getByText('Первая версия описания', { exact: true }).count(), 1)
     assert.equal(await heading(app.page, 'IDDQD').count(), 0, 'скрытая в secrets.json секретка не показывается')
     assert.equal(await heading(app.page, 'Ушёл за чаем').count(), 1, 'встроенные секретки на месте')
+    assert.equal(await heading(app.page, 'Опенинг — святое').count(), 1, 'секретка с длинным тире не скрывается старым именем с дефисом')
+    assert.equal(await heading(app.page, 'Опенинг - святое').count(), 0, 'старое написание с дефисом не дублируется')
     assert.equal(await heading(app.page, 'Плохой код').count(), 1)
     assert.equal(await heading(app.page, 'Чужой владелец').count(), 0)
     await app.page.getByRole('button', { name: 'Как получить: Тестовая секретка' }).click()
