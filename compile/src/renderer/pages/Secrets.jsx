@@ -1,7 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import bundledCatalog from '../../shared/secrets.json'
 import bundledIcons from '../../shared/secretIcons.json'
-import { mergeSecretsCatalogs, sanitizeSecretsCatalog } from '../../shared/secretsCatalog'
+import { mergeSecretsCatalogs, normalizeSecretName, sanitizeSecretsCatalog } from '../../shared/secretsCatalog'
 import GuideText from '../components/GuideText'
 
 // Список секреток, гайды, иконки и награды лежат в src/shared/secrets.json. Встроенная
@@ -13,7 +13,7 @@ import GuideText from '../components/GuideText'
 
 // Старые коды и названия из прошлых версий списка и сохранённых данных → нынешние на сайте
 const CODE_ALIASES = { secret_midnight_premiere: 'secret_midnight_start', secret_omedeto: 'secret_omedetou', secret_exchange: 'secret_equivalent_exchange', secret_midnight_anomaly: 'secret_anomaly_midnight' }
-const NAME_ALIASES = { 'полночная премьера': 'ровно в полночь', 'тайминг': 'внахлёст', 'отошел за чаем': 'ушёл за чаем', 'отошёл за чаем': 'ушёл за чаем', 'ушел за чаем': 'ушёл за чаем', '1000-7': '1000 − 7' }
+const NAME_ALIASES = { 'полночная премьера': 'ровно в полночь', 'тайминг': 'внахлест', 'отошел за чаем': 'ушел за чаем' }
 
 const ICON_RE = /^gi:[a-z0-9-]{1,64}$/
 const PATH_RE = /^[MmLlHhVvCcSsQqTtAaZz0-9.,\-\se]{1,20000}$/
@@ -29,7 +29,7 @@ const rawCodeOf = item => {
 }
 const codeOf = item => CODE_ALIASES[rawCodeOf(item)] || rawCodeOf(item)
 const rawNameOf = item => String(item?.name || item?.title || item?.achievement_name || '').trim()
-const nameOf = item => { const name = rawNameOf(item).toLowerCase(); return NAME_ALIASES[name] || name }
+const nameOf = item => { const name = normalizeSecretName(rawNameOf(item)); return NAME_ALIASES[name] || name }
 const identityOf = item => codeOf(item) || 'name:' + nameOf(item)
 const reward = value => Number.isInteger(value) && value >= 0 && value <= 100000 ? value : undefined
 const iconOf = value => typeof value === 'string' && ICON_RE.test(value.trim().toLowerCase()) ? value.trim().toLowerCase() : undefined
@@ -42,7 +42,7 @@ let HIDDEN = new Set()
 const BUNDLED_CATALOG = sanitizeSecretsCatalog(bundledCatalog)
 function applyCatalog(fresh) {
   const merged = mergeSecretsCatalogs(BUNDLED_CATALOG, sanitizeSecretsCatalog(fresh))
-  HIDDEN = new Set(merged.hidden.map(entry => entry.startsWith('name:') ? 'name:' + nameOf({ name: entry.slice(5) }) : (CODE_ALIASES[entry] || entry)))
+  HIDDEN = new Set(merged.hidden.map(entry => entry.startsWith('name:') ? entry : (CODE_ALIASES[entry] || entry)))
   // После алиасов старая и новая запись одной секретки сливаются в одну
   const byIdentity = new Map()
   for (const secret of merged.secrets) {
@@ -55,7 +55,8 @@ function applyCatalog(fresh) {
   }
   FILE_DEFS = [...byIdentity.values()].filter(def => !isHidden(def))
 }
-const isHidden = item => HIDDEN.has(codeOf(item)) || HIDDEN.has('name:' + nameOf(item))
+// Скрытие по имени ("name:...") проверяем буквально, чтобы скрытие старого написания с дефисом не задело исправленное с тире
+const isHidden = item => HIDDEN.has(codeOf(item)) || HIDDEN.has('name:' + rawNameOf(item).toLowerCase())
 applyCatalog(null)
 
 const isSecretRemote = item => {
@@ -106,7 +107,7 @@ function buildCards(discovered) {
     const extra = { code: codeOf(item) || null, name: textOf(item.name, 80), description: textOf(item.description, 300), icon: iconOf(item.icon), trophies: reward(item.trophies), animon: reward(item.animon) }
     if (index >= 0) {
       const card = cards[index]
-      cards[index] = { ...card, code: card.code || extra.code, description: card.description || extra.description, icon: card.icon || extra.icon, trophies: card.trophies ?? extra.trophies, animon: card.animon ?? extra.animon }
+      cards[index] = { ...card, code: card.code || extra.code, name: (!card.code && extra.name) || card.name, description: card.description || extra.description, icon: card.icon || extra.icon, trophies: card.trophies ?? extra.trophies, animon: card.animon ?? extra.animon }
     } else if (extra.name) cards.push({ ...extra, desc: '', fromAccount: true })
   }
   return cards.map(card => ({ ...card, id: identityOf(card) }))
