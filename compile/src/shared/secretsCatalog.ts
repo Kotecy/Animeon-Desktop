@@ -54,6 +54,19 @@ export function isSecretIconPath(value: unknown) {
   return typeof value === 'string' && SVG_PATH_RE.test(value)
 }
 
+// Нормализация названия для сопоставления: регистр, ё→е, любые тире/минусы и пробелы вокруг них,
+// чтобы варианты вроде «Опенинг - святое» и «Опенинг — святое» считались одной секреткой.
+export function normalizeSecretName(name: string) {
+  return String(name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/ё/g, 'е')
+    .replace(/[\u2010-\u2015\u2212-]+/g, '-')
+    .replace(/\s*-\s*/g, ' - ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
 export function secretKeyFor(code: string | null, name: string) {
   return code || 'name:' + name.toLowerCase()
 }
@@ -73,7 +86,7 @@ export function sanitizeSecretsCatalog(raw: unknown): SecretsCatalog | null {
     const code = CODE_RE.test(rawCode) ? rawCode : null
     const rawKey = typeof entry.key === 'string' ? entry.key.trim() : ''
     const key = KEY_RE.test(rawKey) ? rawKey : secretKeyFor(code, name)
-    const identity = code || 'name:' + name.toLowerCase()
+    const identity = code || 'name:' + normalizeSecretName(name)
     if (seen.has(identity) || seen.has('key:' + key)) continue
     seen.add(identity); seen.add('key:' + key)
     // Недостижимые («в единственном экземпляре») больше не показываем
@@ -110,8 +123,8 @@ export function sanitizeSecretsCatalog(raw: unknown): SecretsCatalog | null {
 export function mergeSecretsCatalogs(base: SecretsCatalog, fresh: SecretsCatalog | null): SecretsCatalog {
   if (!fresh) return base
   const freshWins = !base.updated || !fresh.updated || fresh.updated >= base.updated
-  const identity = (item: SecretDef) => item.code || 'name:' + item.name.toLowerCase()
-  const byName = (item: SecretDef) => 'name:' + item.name.toLowerCase()
+  const identity = (item: SecretDef) => item.code || 'name:' + normalizeSecretName(item.name)
+  const byName = (item: SecretDef) => 'name:' + normalizeSecretName(item.name)
   const result = base.secrets.map(item => ({ ...item }))
   for (const item of fresh.secrets) {
     const index = result.findIndex(existing => identity(existing) === identity(item) || byName(existing) === byName(item))
