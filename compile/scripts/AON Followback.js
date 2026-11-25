@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AON Followback
 // @namespace    https://animeon.co/
-// @version      1.3.0
-// @description  Безопасная взаимная автоподписка для AnimeOn с верхними вкладками, хуманайзером и белым/чёрным списками
+// @version      1.4.0
+// @description  Взаимная автоподписка для AnimeOn
 // @match        https://animeon.cc/*
 // @match        https://www.animeon.cc/*
 // @match        https://v1.animeon.co/*
@@ -20,17 +20,50 @@
     try {
         Object.defineProperty(window, '__AON_FOLLOWBACK_LOADED__', {
             value: true,
-            writable: false,
+            writable: true,
             enumerable: false,
-            configurable: false
+            configurable: true
         });
     } catch (e) {
         window.__AON_FOLLOWBACK_LOADED__ = true;
     }
 
-    const DEBUG = false;
+    const SCRIPT_VERSION = '1.4.0';
+    let fbStopped = false;
+    const fbIntervals = new Set();
+    const fbTimeouts = new Set();
+    const fbListeners = [];
+    const setInterval = (fn, ms, ...args) => {
+        const id = window.setInterval(() => { if (!fbStopped) fn(...args); }, ms);
+        fbIntervals.add(id);
+        return id;
+    };
+    const clearInterval = (id) => { fbIntervals.delete(id); window.clearInterval(id); };
+    const setTimeout = (fn, ms, ...args) => {
+        const id = window.setTimeout(() => { fbTimeouts.delete(id); if (!fbStopped) fn(...args); }, ms);
+        fbTimeouts.add(id);
+        return id;
+    };
+    const clearTimeout = (id) => { fbTimeouts.delete(id); window.clearTimeout(id); };
+    function on(target, type, fn, opts) {
+        target.addEventListener(type, fn, opts);
+        fbListeners.push([target, type, fn, opts]);
+    }
+
+    const DEBUG = (function () {
+        try { return localStorage.getItem('__aon_fb_debug') === '1'; } catch (e) { return false; }
+    })();
     function logDebug(...args) {
         if (DEBUG) console.log('[AON Followback]', ...args);
+    }
+
+    function esc(v) {
+        return String(v == null ? '' : v)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -54,6 +87,34 @@
     const FOLLOWBACK_MAX_PAGES = 10;
     const CHECK_INTERVAL_SEC = 300; // 5 минут
     const MAX_ACTIONS_PER_RUN = 5;  // Не более 5 действий за цикл
+    const MAX_NAMEMAP_ENTRIES = 1000;
+
+    const store = (() => {
+        const cache = new Map();
+        return {
+            read(key, fallback) {
+                if (cache.has(key)) return cache.get(key);
+                let val = fallback;
+                try {
+                    const raw = localStorage.getItem(key);
+                    val = raw === null ? fallback : JSON.parse(raw);
+                } catch (e) {
+                    val = fallback;
+                }
+                cache.set(key, val);
+                return val;
+            },
+            write(key, value) {
+                cache.set(key, value);
+                try {
+                    if (value === null || value === undefined) localStorage.removeItem(key);
+                    else localStorage.setItem(key, JSON.stringify(value));
+                } catch (e) {}
+            },
+            invalidate(key) { cache.delete(key); },
+            invalidateAll() { cache.clear(); }
+        };
+    })();
 
     // ─────────────────────────────────────────────────────────────
     // 2. НАСТРОЙКИ
@@ -98,16 +159,12 @@
     // 3. БЕЛЫЙ И ЧЁРНЫЙ СПИСКИ
     // ─────────────────────────────────────────────────────────────
     function getWhitelist() {
-        try {
-            const raw = localStorage.getItem(WHITELIST_KEY);
-            return raw ? JSON.parse(raw) : [];
-        } catch (e) { return []; }
+        const v = store.read(WHITELIST_KEY, []);
+        return Array.isArray(v) ? v : [];
     }
 
     function saveWhitelist(list) {
-        try {
-            localStorage.setItem(WHITELIST_KEY, JSON.stringify(list));
-        } catch (e) {}
+        store.write(WHITELIST_KEY, list);
     }
 
     function normalizeName(input) {
@@ -135,22 +192,11 @@
         return String(u.username || u.name || u.slug || u.username_slug || '').trim();
     }
 
-    function isWhitelisted(slug, dispName, whitelistSet) {
-        if (!whitelistSet || whitelistSet.size === 0) return false;
+    function isInListSet(slug, dispName, set) {
+        if (!set || set.size === 0) return false;
         const s = slug ? String(slug).toLowerCase().trim() : '';
         const d = dispName ? String(dispName).toLowerCase().trim() : '';
-        if (s && whitelistSet.has(s)) return true;
-        if (d && whitelistSet.has(d)) return true;
-        return false;
-    }
-
-    function isBlacklisted(slug, dispName, blacklistSet) {
-        if (!blacklistSet || blacklistSet.size === 0) return false;
-        const s = slug ? String(slug).toLowerCase().trim() : '';
-        const d = dispName ? String(dispName).toLowerCase().trim() : '';
-        if (s && blacklistSet.has(s)) return true;
-        if (d && blacklistSet.has(d)) return true;
-        return false;
+        return (s && set.has(s)) || (d && set.has(d));
     }
 
     function extractUsersList(data) {
@@ -162,91 +208,90 @@
         return [];
     }
 
-    function extractTotal(data, fallbackCount) {
-        if (!data) return fallbackCount;
-        if (typeof data.total === 'number') return data.total;
-        if (typeof data.total === 'string' && !isNaN(Number(data.total))) return Number(data.total);
-        if (data.pagination) {
-            if (typeof data.pagination.total === 'number') return data.pagination.total;
-            if (typeof data.pagination.total === 'string' && !isNaN(Number(data.pagination.total))) return Number(data.pagination.total);
-            if (typeof data.pagination.count === 'number') return data.pagination.count;
+    // Возвращает явный total от сервера, либо null — чтобы отсутствие total
+    // не обрывало пагинацию на 1-й странице и не ломало полноту списка.
+    function extractExplicitTotal(data) {
+        if (!data) return null;
+        const candidates = [
+            data.total,
+            data.count,
+            data.pagination?.total,
+            data.pagination?.count,
+            data.meta?.total,
+            data.meta?.count
+        ];
+        for (const v of candidates) {
+            if (typeof v === 'number' && isFinite(v)) return v;
+            if (typeof v === 'string' && v.trim() !== '' && !isNaN(Number(v))) return Number(v);
         }
-        if (data.meta) {
-            if (typeof data.meta.total === 'number') return data.meta.total;
-            if (typeof data.meta.total === 'string' && !isNaN(Number(data.meta.total))) return Number(data.meta.total);
-        }
-        if (typeof data.count === 'number') return data.count;
-        return fallbackCount;
+        return null;
     }
 
-    function addToWhitelist(name) {
-        const clean = normalizeName(name);
-        if (!clean) return false;
-        const lower = clean.toLowerCase();
-        const list = getWhitelist();
-        if (!list.map(s => normalizeName(s).toLowerCase()).includes(lower)) {
-            list.push(clean);
-            saveWhitelist(list);
-            addJournalEntry(`Добавлен в белый список: ${clean}`, 'info');
-            return true;
+    function addNamesToList(rawInput, isWhite) {
+        const tokens = String(rawInput || '')
+            .split(/[\r\n,;]+/)
+            .map(normalizeName)
+            .filter(Boolean);
+        if (!tokens.length) return 0;
+
+        const list = (isWhite ? getWhitelist() : getBlacklist()).slice();
+        const existing = new Set(list.map(s => normalizeName(s).toLowerCase()));
+        const added = [];
+
+        for (const clean of tokens) {
+            const lower = clean.toLowerCase();
+            if (!existing.has(lower)) {
+                existing.add(lower);
+                list.push(clean);
+                added.push(clean);
+            }
         }
-        return false;
+        if (!added.length) return 0;
+
+        if (isWhite) {
+            saveWhitelist(list);
+            addJournalEntry(`Белый список (+${added.length}): ${added.join(', ')}`, 'info', 'system');
+        } else {
+            saveBlacklist(list);
+            addJournalEntry(`Чёрный список (+${added.length}): ${added.join(', ')}`, 'warn', 'system');
+        }
+        return added.length;
     }
 
     function removeFromWhitelist(name) {
         const lower = normalizeName(name).toLowerCase();
         const list = getWhitelist().filter(s => normalizeName(s).toLowerCase() !== lower);
         saveWhitelist(list);
-        addJournalEntry(`Удалён из белого списка: ${normalizeName(name)}`, 'info');
+        addJournalEntry(`Удалён из белого списка: ${normalizeName(name)}`, 'info', 'system');
     }
 
     function getBlacklist() {
-        try {
-            const raw = localStorage.getItem(BLACKLIST_KEY);
-            return raw ? JSON.parse(raw) : [];
-        } catch (e) { return []; }
+        const v = store.read(BLACKLIST_KEY, []);
+        return Array.isArray(v) ? v : [];
     }
 
     function saveBlacklist(list) {
-        try {
-            localStorage.setItem(BLACKLIST_KEY, JSON.stringify(list));
-        } catch (e) {}
-    }
-
-    function addToBlacklist(name) {
-        const clean = normalizeName(name);
-        if (!clean) return false;
-        const lower = clean.toLowerCase();
-        const list = getBlacklist();
-        if (!list.map(s => normalizeName(s).toLowerCase()).includes(lower)) {
-            list.push(clean);
-            saveBlacklist(list);
-            addJournalEntry(`Добавлен в чёрный список: ${clean}`, 'warn');
-            return true;
-        }
-        return false;
+        store.write(BLACKLIST_KEY, list);
     }
 
     function removeFromBlacklist(name) {
         const lower = normalizeName(name).toLowerCase();
         const list = getBlacklist().filter(s => normalizeName(s).toLowerCase() !== lower);
         saveBlacklist(list);
-        addJournalEntry(`Удалён из чёрного списка: ${normalizeName(name)}`, 'info');
+        addJournalEntry(`Удалён из чёрного списка: ${normalizeName(name)}`, 'info', 'system');
     }
 
     // ─────────────────────────────────────────────────────────────
     // 4. ЖУРНАЛ И СТАТИСТИКА
     // ─────────────────────────────────────────────────────────────
     function getJournal() {
-        try {
-            const raw = localStorage.getItem(JOURNAL_KEY);
-            return raw ? JSON.parse(raw) : [];
-        } catch (e) { return []; }
+        const v = store.read(JOURNAL_KEY, []);
+        return Array.isArray(v) ? v : [];
     }
 
-    function addJournalEntry(text, type = 'info') {
+    function addJournalEntry(text, type = 'info', kind = 'system') {
         try {
-            const items = getJournal();
+            const items = getJournal().slice();
             const now = new Date();
             const timeStr = [
                 String(now.getHours()).padStart(2, '0'),
@@ -255,44 +300,57 @@
             ].join(':');
 
             if (items.length > 0 && items[0].text === text) return;
+            if (items.slice(0, 5).some(it => it.text === text && Date.now() - (Number(it.id) || 0) < 30000)) return;
 
             const entry = {
                 id: Date.now() + Math.random(),
                 time: timeStr,
                 text,
-                type // 'info', 'success', 'warn'
+                type,
+                kind // 'follow' | 'unfollow' | 'system'
             };
 
             items.unshift(entry);
-            if (items.length > 60) items.length = 60;
-            localStorage.setItem(JOURNAL_KEY, JSON.stringify(items));
+            if (items.length > 80) items.length = 80;
+            store.write(JOURNAL_KEY, items);
 
             if (shadow && isModalOpen && (settings.activeTab || 'main') === 'journal') {
-                renderTabContent();
+                const list = shadow.querySelector('.fb-journal-list');
+                const countEl = shadow.querySelector('#fb-journal-count');
+                if (countEl) countEl.textContent = String(items.length);
+                const matches = journalFilter === 'all' || entry.kind === journalFilter;
+                if (list && matches) {
+                    const emptyEl = list.querySelector('.fb-empty-hint');
+                    if (emptyEl) emptyEl.remove();
+                    const el = document.createElement('div');
+                    el.className = `fb-journal-item ${entry.type || 'info'}`;
+                    el.innerHTML = `
+                        <span class="fb-journal-dot"></span>
+                        <span class="fb-journal-time">${esc(entry.time)}</span>
+                        <span class="fb-journal-text">${esc(entry.text)}</span>
+                    `;
+                    list.insertBefore(el, list.firstChild);
+                }
             }
         } catch (e) {}
     }
 
     function clearJournal() {
-        try {
-            localStorage.setItem(JOURNAL_KEY, JSON.stringify([]));
-        } catch (e) {}
+        store.write(JOURNAL_KEY, []);
     }
 
     function getFbStats() {
-        try {
-            const raw = localStorage.getItem(STATS_KEY);
-            return raw ? JSON.parse(raw) : { followedTotal: 0, unfollowedTotal: 0, lastCheckTs: 0, lastCheckText: '' };
-        } catch (e) {
-            return { followedTotal: 0, unfollowedTotal: 0, lastCheckTs: 0, lastCheckText: '' };
-        }
+        const v = store.read(STATS_KEY, null);
+        return v && typeof v === 'object' ? v : { followedTotal: 0, unfollowedTotal: 0, lastCheckTs: 0, lastCheckText: '' };
     }
 
     function updateFbStats(patch) {
         try {
             const cur = getFbStats();
-            const updated = { ...cur, ...patch };
-            localStorage.setItem(STATS_KEY, JSON.stringify(updated));
+            const keys = Object.keys(patch || {});
+            if (!keys.some(k => cur[k] !== patch[k])) return;
+            store.write(STATS_KEY, { ...cur, ...patch });
+            updateUI();
         } catch (e) {}
     }
 
@@ -302,13 +360,6 @@
     function humanDelay(minMs = 1500, maxMs = 3500) {
         const ms = Math.floor(minMs + Math.random() * (maxMs - minMs));
         return new Promise(r => setTimeout(r, ms));
-    }
-
-    function escapeHtml(str) {
-        if (!str) return '';
-        const d = document.createElement('div');
-        d.textContent = String(str);
-        return d.innerHTML;
     }
 
     function formatSecsToHuman(sec) {
@@ -328,30 +379,20 @@
     async function resolveOwnUsernameSlug() {
         if (cachedOwnSlug) return cachedOwnSlug;
 
-        try {
-            const res = await fetch('/api/users/me', { credentials: 'include' });
-            if (res.ok) {
-                const j = await res.json().catch(() => null);
-                const slug = j && (j.username_slug || j.slug || j.username);
-                if (slug && slug !== 'me') {
-                    cachedOwnSlug = String(slug);
-                    return cachedOwnSlug;
+        for (const endpoint of ['/api/users/me', '/api/auth/me']) {
+            try {
+                const res = await fetch(endpoint, { credentials: 'include' });
+                if (res.ok) {
+                    const j = await res.json().catch(() => null);
+                    const u = j && (j.user || j.data || j);
+                    const slug = u && (u.username_slug || u.slug || u.username);
+                    if (slug && slug !== 'me') {
+                        cachedOwnSlug = String(slug);
+                        return cachedOwnSlug;
+                    }
                 }
-            }
-        } catch (e) {}
-
-        try {
-            const res = await fetch('/api/auth/me', { credentials: 'include' });
-            if (res.ok) {
-                const j = await res.json().catch(() => null);
-                const u = j && (j.user || j.data || j);
-                const slug = u && (u.username_slug || u.slug || u.username);
-                if (slug && slug !== 'me') {
-                    cachedOwnSlug = String(slug);
-                    return cachedOwnSlug;
-                }
-            }
-        } catch (e) {}
+            } catch (e) {}
+        }
 
         try {
             const keyRe = /user|auth|session|account|profile|persist|pinia/i;
@@ -371,7 +412,7 @@
 
         try {
             const slugRe = /"username_slug"\s*:\s*"([^"]+)"/;
-            for (const s of Array.from(document.querySelectorAll('script'))) {
+            for (const s of document.querySelectorAll('script')) {
                 const text = s.textContent || '';
                 if (!text.includes('username_slug')) continue;
                 const m = text.match(slugRe);
@@ -417,78 +458,90 @@
         } catch (e) {}
     }
 
-    async function fetchFollowersList(ownSlug) {
+    async function fetchPaginatedUsers(ownSlug, kind) {
         const all = [];
-        let total = Infinity;
+        let explicitTotal = null;
         let isComplete = false;
-        for (let page = 1; page <= FOLLOWBACK_MAX_PAGES && (page - 1) * FOLLOWBACK_PAGE_SIZE < total; page++) {
+
+        for (let page = 1; page <= FOLLOWBACK_MAX_PAGES; page++) {
+            if (explicitTotal !== null && (page - 1) * FOLLOWBACK_PAGE_SIZE >= explicitTotal) {
+                isComplete = true;
+                break;
+            }
+            if (page > 1) await humanDelay(180, 360);
+
             let resp;
             try {
-                resp = await fetch(`/api/users/${encodeURIComponent(ownSlug)}/followers?page=${page}&per_page=${FOLLOWBACK_PAGE_SIZE}`, {
+                resp = await fetch(`/api/users/${encodeURIComponent(ownSlug)}/${kind}?page=${page}&per_page=${FOLLOWBACK_PAGE_SIZE}`, {
                     credentials: 'include'
                 });
-            } catch (e) { break; }
+            } catch (e) {
+                return { all, total: explicitTotal ?? all.length, complete: false, error: true };
+            }
 
             if (!resp || !resp.ok) {
                 if (resp && resp.status === 429) throw new Error('RATE_LIMIT');
+                if (resp && (resp.status === 401 || resp.status === 403)) cachedOwnSlug = null;
+                return { all, total: explicitTotal ?? all.length, complete: false, error: true };
+            }
+
+            const data = await resp.json().catch(() => null);
+            if (!data) return { all, total: explicitTotal ?? all.length, complete: false, error: true };
+
+            const users = extractUsersList(data);
+            if (explicitTotal === null) {
+                explicitTotal = extractExplicitTotal(data);
+            }
+            all.push(...users);
+
+            if (users.length < FOLLOWBACK_PAGE_SIZE) {
+                isComplete = true;
                 break;
             }
-            const data = await resp.json().catch(() => null);
-            if (!data) break;
-            const users = extractUsersList(data);
-            total = extractTotal(data, (page - 1) * FOLLOWBACK_PAGE_SIZE + users.length);
-            all.push(...users);
-            if (users.length < FOLLOWBACK_PAGE_SIZE || (page * FOLLOWBACK_PAGE_SIZE >= total)) {
+            if (explicitTotal !== null && page * FOLLOWBACK_PAGE_SIZE >= explicitTotal) {
                 isComplete = true;
                 break;
             }
         }
-        return { all, total: isFinite(total) ? total : all.length, complete: isComplete };
+
+        return {
+            all,
+            total: explicitTotal !== null ? explicitTotal : all.length,
+            complete: isComplete,
+            error: false
+        };
+    }
+
+    async function fetchFollowersList(ownSlug) {
+        const res = await fetchPaginatedUsers(ownSlug, 'followers');
+        return { all: res.all, total: res.total, complete: res.complete, error: res.error };
     }
 
     async function fetchFollowingData(ownSlug) {
+        const res = await fetchPaginatedUsers(ownSlug, 'following');
+        if (res.error && res.all.length === 0) return null;
+
         const slugs = [];
         const caseMap = new Map();
         const namesMap = {};
-        let total = Infinity;
-        let isComplete = false;
-        for (let page = 1; page <= FOLLOWBACK_MAX_PAGES && (page - 1) * FOLLOWBACK_PAGE_SIZE < total; page++) {
-            let resp;
-            try {
-                resp = await fetch(`/api/users/${encodeURIComponent(ownSlug)}/following?page=${page}&per_page=${FOLLOWBACK_PAGE_SIZE}`, {
-                    credentials: 'include'
-                });
-            } catch (e) { return null; }
 
-            if (!resp || !resp.ok) {
-                if (resp && resp.status === 429) throw new Error('RATE_LIMIT');
-                return null;
-            }
-            const data = await resp.json().catch(() => null);
-            if (!data) return null;
-            const users = extractUsersList(data);
-            total = extractTotal(data, (page - 1) * FOLLOWBACK_PAGE_SIZE + users.length);
-            for (const u of users) {
-                const orig = getUserSlug(u);
-                if (orig) {
-                    const s = orig.toLowerCase();
-                    slugs.push(s);
-                    if (!caseMap.has(s)) caseMap.set(s, orig);
-                    const disp = getUserDisplayName(u);
-                    if (disp) namesMap[s] = disp;
-                }
-            }
-            if (users.length < FOLLOWBACK_PAGE_SIZE || (page * FOLLOWBACK_PAGE_SIZE >= total)) {
-                isComplete = true;
-                break;
+        for (const u of res.all) {
+            const orig = getUserSlug(u);
+            if (orig) {
+                const s = orig.toLowerCase();
+                slugs.push(s);
+                if (!caseMap.has(s)) caseMap.set(s, orig);
+                const disp = getUserDisplayName(u);
+                if (disp) namesMap[s] = disp;
             }
         }
+
         return {
             slugs,
             caseMap,
             namesMap,
-            total: isFinite(total) ? total : slugs.length,
-            complete: isComplete
+            total: res.total,
+            complete: res.complete
         };
     }
 
@@ -507,6 +560,24 @@
         } catch (e) { return true; }
     }
 
+    function refreshFollowbackLock() {
+        try {
+            const raw = localStorage.getItem(LOCK_KEY);
+            const lock = raw ? JSON.parse(raw) : null;
+            if (!lock || lock.tabId === TAB_ID) {
+                localStorage.setItem(LOCK_KEY, JSON.stringify({ tabId: TAB_ID, ts: Date.now() }));
+            }
+        } catch (e) {}
+    }
+
+    function releaseFollowbackLock() {
+        try {
+            const raw = localStorage.getItem(LOCK_KEY);
+            const lock = raw ? JSON.parse(raw) : null;
+            if (lock && lock.tabId === TAB_ID) localStorage.removeItem(LOCK_KEY);
+        } catch (e) {}
+    }
+
     // ─────────────────────────────────────────────────────────────
     // 8. ЦИКЛ АВТОПОДПИСКИ (МАКС 5 ДЕЙСТВИЙ РАЗ В 5 МИНУТ)
     // ─────────────────────────────────────────────────────────────
@@ -515,7 +586,7 @@
     let fbNextCheckTs = 0;
 
     async function performFollowbackCheck(isManual = false) {
-        if (fbIsChecking) return;
+        if (fbStopped || fbIsChecking) return;
         if (!settings.enabled && !isManual) return;
 
         const now = Date.now();
@@ -539,20 +610,29 @@
         try {
             const ownSlug = await resolveOwnUsernameSlug();
             if (!ownSlug) {
-                if (isManual) addJournalEntry('Ошибка: не удалось определить аккаунт (войдите на сайт)', 'warn');
+                if (isManual) addJournalEntry('Ошибка: не удалось определить аккаунт (войдите на сайт)', 'warn', 'system');
                 return;
             }
 
             await humanDelay(600, 1200);
+            if (fbStopped) return;
 
             const followersData = await fetchFollowersList(ownSlug);
+            if (followersData.error) {
+                if (isManual) addJournalEntry('Ошибка загрузки списка подписчиков', 'warn', 'system');
+                return;
+            }
             const allFollowers = followersData.all || [];
             const totalFollowers = followersData.total || 0;
 
             await humanDelay(800, 1500);
+            if (fbStopped) return;
 
             const followingData = await fetchFollowingData(ownSlug);
-            if (!followingData) return;
+            if (!followingData) {
+                if (isManual) addJournalEntry('Ошибка загрузки списка подписок', 'warn', 'system');
+                return;
+            }
 
             const followingSet = new Set(followingData.slugs || []);
             const doneSet = getFbDoneSet(ownSlug);
@@ -575,6 +655,14 @@
             if (followingData.namesMap) {
                 Object.assign(nameMap, followingData.namesMap);
             }
+            const nameKeys = Object.keys(nameMap);
+            if (nameKeys.length > MAX_NAMEMAP_ENTRIES) {
+                const trimmed = {};
+                for (const k of nameKeys.slice(nameKeys.length - MAX_NAMEMAP_ENTRIES)) {
+                    trimmed[k] = nameMap[k];
+                }
+                nameMap = trimmed;
+            }
             try { localStorage.setItem(NAMEMAP_KEY, JSON.stringify(nameMap)); } catch (e) {}
 
             if (followingData.complete) {
@@ -588,8 +676,9 @@
             // Зеркальная отписка (с иммунитетом для белого списка)
             let unfollowedCount = 0;
             if (settings.unfollowEnabled && actionsDone < MAX_ACTIONS_PER_RUN) {
-                if (!listsComplete) {
-                    addJournalEntry('Зеркальная отписка приостановлена: список подписок/читателей слишком велик для безопасного сравнения', 'warn');
+                const suspiciousEmpty = allFollowers.length === 0 && totalFollowers > 0;
+                if (!listsComplete || suspiciousEmpty) {
+                    addJournalEntry('Зеркальная отписка пропущена: неполный ответ списка читателей/подписок', 'warn', 'system');
                 } else {
                     const followerSlugs = new Set();
                     for (const u of allFollowers) {
@@ -597,16 +686,16 @@
                         if (s) followerSlugs.add(s.toLowerCase());
                     }
 
-                    // Зеркальная отписка от всех, кто не подписан на нас (кроме белого списка)
                     const toUnfollow = Array.from(followingSet).filter(slug => {
                         const disp = nameMap[slug] || slug;
-                        if (isWhitelisted(slug, disp, whitelist)) return false; // Иммунитет белого списка
-                        return !followerSlugs.has(slug);                       // Человек не подписан на нас
+                        if (isInListSet(slug, disp, whitelist)) return false;
+                        return !followerSlugs.has(slug);
                     }).slice(0, MAX_ACTIONS_PER_RUN - actionsDone);
 
                     for (const slug of toUnfollow) {
-                        if (actionsDone >= MAX_ACTIONS_PER_RUN) break;
+                        if (fbStopped || actionsDone >= MAX_ACTIONS_PER_RUN) break;
                         await humanDelay(1500, 3200);
+                        refreshFollowbackLock();
                         try {
                             const origCase = followingData.caseMap?.get(slug) || slug;
                             let res = await fetch(`/api/users/${encodeURIComponent(origCase)}/follow`, {
@@ -627,11 +716,11 @@
                                 unfollowedCount++;
                                 actionsDone++;
                                 const dispName = nameMap[slug] || origCase;
-                                addJournalEntry(`Зеркальная отписка: ${dispName}`, 'warn');
+                                addJournalEntry(`Зеркальная отписка: ${dispName}`, 'warn', 'unfollow');
                             } else if (res.status === 429) {
                                 throw new Error('RATE_LIMIT');
                             } else {
-                                addJournalEntry(`Ошибка отписки от ${origCase} (HTTP ${res.status})`, 'warn');
+                                addJournalEntry(`Ошибка отписки от ${origCase} (HTTP ${res.status})`, 'warn', 'system');
                             }
                         } catch (err) {
                             if (err.message === 'RATE_LIMIT') throw err;
@@ -647,7 +736,7 @@
                 if (!slugRaw) continue;
                 const slug = slugRaw.toLowerCase();
                 const disp = getUserDisplayName(u) || slug;
-                if (isBlacklisted(slug, disp, blacklist)) continue;
+                if (isInListSet(slug, disp, blacklist)) continue;
                 if (u.is_following || followingSet.has(slug) || doneSet.has(slug)) continue;
                 toFollow.push({ ...u, _slug: slug, _orig: slugRaw, _disp: disp });
             }
@@ -657,8 +746,9 @@
                 const batch = toFollow.slice(0, MAX_ACTIONS_PER_RUN - actionsDone);
 
                 for (const u of batch) {
-                    if (actionsDone >= MAX_ACTIONS_PER_RUN) break;
+                    if (fbStopped || actionsDone >= MAX_ACTIONS_PER_RUN) break;
                     await humanDelay(1600, 3400);
+                    refreshFollowbackLock();
                     const slug = u._slug;
                     const origCase = u._orig;
                     try {
@@ -675,7 +765,7 @@
                             const dispName = u._disp || origCase;
                             nameMap[slug] = dispName;
                             showToast(`Подписался на ${dispName}`);
-                            addJournalEntry(`Подписка: ${dispName}`, 'success');
+                            addJournalEntry(`Подписка: ${dispName}`, 'success', 'follow');
                         } else if (res.status === 429) {
                             throw new Error('RATE_LIMIT');
                         }
@@ -688,7 +778,7 @@
             saveFbDoneSet(ownSlug, doneSet);
 
             const curStats = getFbStats();
-            const timeStr = new Date().toLocaleTimeString();
+            const timeStr = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
             updateFbStats({
                 followedTotal: (curStats.followedTotal || 0) + followedCount,
                 unfollowedTotal: (curStats.unfollowedTotal || 0) + unfollowedCount,
@@ -697,16 +787,17 @@
             });
 
             if (isManual && followedCount === 0 && unfollowedCount === 0) {
-                addJournalEntry('Проверка: всё синхронно, новых подписчиков нет', 'info');
+                addJournalEntry('Проверка: всё синхронно, новых подписчиков нет', 'info', 'system');
             }
 
         } catch (err) {
             if (err.message === 'RATE_LIMIT') {
                 const cool = Date.now() + 15 * 60 * 1000;
                 try { localStorage.setItem(COOLDOWN_KEY, String(cool)); } catch (e) {}
-                addJournalEntry('Лимит API (429). Пауза 15 минут.', 'warn');
+                addJournalEntry('Лимит API (429). Пауза 15 минут.', 'warn', 'system');
             }
         } finally {
+            releaseFollowbackLock();
             fbIsChecking = false;
             updateUI();
             scheduleNextCheck();
@@ -715,13 +806,12 @@
 
     function scheduleNextCheck(delaySec) {
         if (fbTimer) { clearTimeout(fbTimer); fbTimer = null; }
-        if (!settings.enabled) return;
-
-        let sec = delaySec;
-        if (!sec) {
-            sec = Math.floor(285 + Math.random() * 30); // ~5 минут
+        if (!settings.enabled || fbStopped) {
+            fbNextCheckTs = 0;
+            return;
         }
 
+        const sec = delaySec || Math.floor(285 + Math.random() * 30); // ~5 минут
         fbNextCheckTs = Date.now() + sec * 1000;
         updateUI();
         fbTimer = setTimeout(() => {
@@ -729,13 +819,37 @@
         }, sec * 1000);
     }
 
+    on(window, 'storage', (ev) => {
+        if (ev.key) store.invalidate(ev.key);
+        else store.invalidateAll();
+
+        if (ev.key === SETTINGS_KEY && ev.newValue) {
+            try {
+                const s = JSON.parse(ev.newValue);
+                const prevEnabled = settings.enabled;
+                settings = { ...settings, ...s };
+                if (!prevEnabled && settings.enabled) scheduleNextCheck(15);
+                else if (prevEnabled && !settings.enabled) scheduleNextCheck();
+                if (isModalOpen) renderTabContent();
+                else updateUI();
+            } catch (e) {}
+        } else if (ev.key === STATS_KEY || ev.key === COOLDOWN_KEY) {
+            updateUI();
+        } else if ((ev.key === WHITELIST_KEY || ev.key === BLACKLIST_KEY || ev.key === JOURNAL_KEY) && isModalOpen) {
+            renderTabContent();
+        }
+    });
+
+    on(window, 'pagehide', releaseFollowbackLock);
+
     // ─────────────────────────────────────────────────────────────
-    // 9. ИНТЕРФЕЙС С ВЕРХНИМИ ВКЛАДКАМИ (TOP TABS)
+    // 9. ИНТЕРФЕЙС (OBSIDIAN STUDIO COMMAND DECK)
     // ─────────────────────────────────────────────────────────────
     let widgetRoot = null;
     let shadow = null;
     let isModalOpen = false;
-    let activeListTab = 'white'; // 'white' | 'black' для вкладки Списки
+    let activeListTab = 'white'; // 'white' | 'black'
+    let journalFilter = 'all';   // 'all' | 'follow' | 'unfollow'
     let lastToggleTime = 0;
 
     function safeToggleModal(forceState) {
@@ -747,18 +861,36 @@
         toggleModal(forceState);
     }
 
+    function clampToViewport(el) {
+        if (!el) return;
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+        let left = rect.left, top = rect.top, changed = false;
+        const maxLeft = Math.max(10, window.innerWidth - rect.width - 10);
+        const maxTop = Math.max(10, window.innerHeight - rect.height - 10);
+        if (left > maxLeft) { left = maxLeft; changed = true; }
+        if (left < 10) { left = 10; changed = true; }
+        if (top > maxTop) { top = maxTop; changed = true; }
+        if (top < 10) { top = 10; changed = true; }
+        if (changed) {
+            el.style.left = Math.round(left) + 'px';
+            el.style.top = Math.round(top) + 'px';
+            el.style.right = 'auto';
+            el.style.bottom = 'auto';
+        }
+    }
+
     function ensureWidget() {
-        if (!document.body) {
+        const hostParent = document.body || document.documentElement;
+        if (!hostParent) {
             if (document.readyState === 'loading') {
-                document.addEventListener('DOMContentLoaded', ensureWidget, { once: true });
+                on(document, 'DOMContentLoaded', ensureWidget, { once: true });
             }
             return;
         }
 
         if (widgetRoot && shadow && shadow.querySelector('.fb-window')) {
-            if (!document.body.contains(widgetRoot)) {
-                document.body.appendChild(widgetRoot);
-            }
+            if (!widgetRoot.isConnected) hostParent.appendChild(widgetRoot);
             return;
         }
 
@@ -767,9 +899,7 @@
             if (existing.shadowRoot && existing.shadowRoot.querySelector('.fb-window')) {
                 widgetRoot = existing;
                 shadow = existing.shadowRoot;
-                if (!document.body.contains(widgetRoot)) {
-                    document.body.appendChild(widgetRoot);
-                }
+                if (!widgetRoot.isConnected) hostParent.appendChild(widgetRoot);
                 return;
             }
             try { existing.remove(); } catch (e) {}
@@ -783,500 +913,369 @@
         style.textContent = `
             :host {
                 all: initial;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", sans-serif;
-                color: #ffffff;
+                --bg-base: #0b0c13;
+                --bg-surface: rgba(255, 255, 255, 0.03);
+                --bg-surface-hover: rgba(255, 255, 255, 0.05);
+                --bg-input: rgba(6, 7, 12, 0.72);
+                --border-hair: rgba(255, 255, 255, 0.08);
+                --border-focus: rgba(155, 123, 247, 0.55);
+                --text-primary: #f2f3f8;
+                --text-muted: #9397ab;
+                --text-dim: #5d6176;
+                --accent: #9b7bf7;
+                --accent-bright: #c4b5fd;
+                --accent-soft: rgba(155, 123, 247, 0.14);
+                --ok: #34d399;
+                --ok-soft: rgba(52, 211, 153, 0.13);
+                --warn: #fbbf24;
+                --danger: #f87171;
+                --danger-soft: rgba(248, 113, 113, 0.13);
+                font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                color: var(--text-primary);
             }
+            *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; scrollbar-width: none !important; -ms-overflow-style: none !important; }
+            ::-webkit-scrollbar { display: none !important; width: 0 !important; height: 0 !important; }
+            button:focus-visible, input:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 2px; }
 
-            *, *::before, *::after {
-                box-sizing: border-box;
-                margin: 0;
-                padding: 0;
-                scrollbar-width: none !important;
-                -ms-overflow-style: none !important;
-            }
-
-            ::-webkit-scrollbar {
-                display: none !important;
-                width: 0 !important;
-                height: 0 !important;
-            }
-
-            /* ── Плавающая мини-кнопка (уменьшена в 2-3 раза) ── */
+            /* ── Плавающая кнопка-триггер ── */
             .fb-btn {
-                position: fixed;
-                bottom: 96px;
-                right: 24px;
-                width: 28px;
-                height: 28px;
-                border-radius: 9px;
-                background: rgba(24, 24, 27, 0.92);
+                position: fixed; bottom: 88px; right: 24px;
+                width: 38px; height: 38px; border-radius: 11px;
+                background: linear-gradient(160deg, rgba(22, 23, 36, 0.96), rgba(11, 12, 19, 0.98));
                 border: 1px solid rgba(255, 255, 255, 0.12);
-                color: #ffffff;
-                box-shadow: 0 4px 14px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.08);
-                backdrop-filter: blur(14px);
-                -webkit-backdrop-filter: blur(14px);
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                cursor: grab;
-                user-select: none;
-                touch-action: none;
+                color: var(--text-primary);
+                box-shadow: 0 10px 26px rgba(0, 0, 0, 0.62), 0 0 0 1px rgba(155, 123, 247, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.11);
+                backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+                display: grid; place-items: center;
+                cursor: grab; user-select: none; touch-action: none;
                 z-index: 2147483644;
-                transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+                transition: transform .18s cubic-bezier(0.16, 1, 0.3, 1), border-color .18s ease, box-shadow .18s ease;
             }
-            .fb-btn:hover {
-                border-color: rgba(139, 92, 246, 0.5);
-                transform: translateY(-1.5px) scale(1.06);
-                box-shadow: 0 6px 18px rgba(0, 0, 0, 0.65), 0 0 12px rgba(139, 92, 246, 0.3);
-            }
-            .fb-btn:active {
-                transform: scale(0.92);
-            }
-            .fb-btn.dragging {
-                cursor: grabbing;
-                transform: scale(0.94);
-            }
-            .fb-btn svg {
-                width: 15px;
-                height: 15px;
-                stroke: #c4b5fd;
-                stroke-width: 2.2;
-                fill: none;
-                transition: stroke 0.18s ease;
-            }
-            .fb-btn:hover svg {
-                stroke: #ddd6fe;
-            }
-
+            .fb-btn:hover { border-color: var(--border-focus); transform: translateY(-2px) scale(1.05); box-shadow: 0 14px 32px rgba(0, 0, 0, 0.72), 0 0 18px rgba(155, 123, 247, 0.28); }
+            .fb-btn:active { transform: scale(0.94); }
+            .fb-btn.dragging { cursor: grabbing; transform: scale(0.94); }
+            .fb-btn svg { width: 17px; height: 17px; stroke: var(--accent-bright); stroke-width: 2; fill: none; }
             .fb-btn-dot {
-                position: absolute;
-                top: -2px;
-                right: -2px;
-                width: 7px;
-                height: 7px;
-                border-radius: 50%;
-                background: #52525b;
-                border: 1.5px solid #09090b;
-                pointer-events: none;
-                transition: background 0.2s ease, box-shadow 0.2s ease;
+                position: absolute; top: -3px; right: -3px;
+                width: 9px; height: 9px; border-radius: 50%;
+                background: #4b4e63; border: 2px solid var(--bg-base);
+                pointer-events: none; transition: background .2s ease, box-shadow .2s ease;
             }
-            .fb-btn-dot.active {
-                background: #8b5cf6;
-                box-shadow: 0 0 8px rgba(124, 77, 255, 0.85);
-            }
+            .fb-btn-dot.active { background: var(--ok); box-shadow: 0 0 8px rgba(52, 211, 153, 0.8); }
+            .fb-btn-dot.checking { background: var(--accent); box-shadow: 0 0 8px rgba(155, 123, 247, 0.85); }
 
-            /* ── Компактное окно меню с верхними кнопками ── */
+            /* ── Окно панели (Obsidian Studio Command Deck) ── */
             .fb-window {
-                position: fixed;
-                bottom: 134px;
-                right: 24px;
-                width: 380px;
-                max-width: calc(100vw - 32px);
-                background: rgba(18, 18, 26, 0.97);
-                backdrop-filter: blur(24px);
-                -webkit-backdrop-filter: blur(24px);
-                border: 1px solid rgba(255, 255, 255, 0.1);
-                border-radius: 18px;
-                box-shadow: 0 20px 50px rgba(0, 0, 0, 0.7), 0 0 30px rgba(139, 92, 246, 0.18);
+                position: fixed; bottom: 136px; right: 24px;
+                width: 416px; max-width: calc(100vw - 24px);
+                background: var(--bg-base);
+                border: 1px solid rgba(255, 255, 255, 0.09);
+                border-radius: 16px;
+                box-shadow: 0 28px 72px rgba(0, 0, 0, 0.85), 0 0 0 1px rgba(155, 123, 247, 0.14), inset 0 1px 0 rgba(255, 255, 255, 0.1);
                 z-index: 2147483645;
                 overflow: hidden;
-                display: none;
-                flex-direction: column;
+                display: none; flex-direction: column;
+                background-image: radial-gradient(circle at 85% -20%, rgba(155, 123, 247, 0.1), transparent 55%);
                 animation: fbPopIn .18s cubic-bezier(0.16, 1, 0.3, 1) forwards;
             }
             @keyframes fbPopIn {
-                from { opacity: 0; transform: scale(0.95) translateY(8px); }
+                from { opacity: 0; transform: scale(0.97) translateY(8px); }
                 to { opacity: 1; transform: scale(1) translateY(0); }
             }
 
             /* ── Шапка ── */
             .fb-head {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                padding: 12px 16px;
-                background: rgba(255, 255, 255, 0.02);
-                border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-                cursor: grab;
-                user-select: none;
+                display: flex; align-items: center; justify-content: space-between;
+                height: 50px; padding: 0 16px;
+                border-bottom: 1px solid var(--border-hair);
+                background: rgba(255, 255, 255, 0.015);
+                cursor: grab; user-select: none;
             }
             .fb-head.dragging { cursor: grabbing; }
-
-            .fb-title-wrap {
-                display: flex;
-                align-items: center;
-                gap: 8px;
+            .fb-head-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+            .fb-brand-icon {
+                width: 28px; height: 28px; border-radius: 8px;
+                background: var(--accent-soft); border: 1px solid rgba(155, 123, 247, 0.32);
+                display: grid; place-items: center; color: var(--accent-bright); flex-shrink: 0;
             }
-            .fb-title-dot {
-                width: 8px;
-                height: 8px;
-                border-radius: 50%;
-                background: #52525b;
-                transition: background .2s ease;
+            .fb-brand-icon svg { width: 15px; height: 15px; stroke: currentColor; stroke-width: 2; fill: none; }
+            .fb-title-group { display: flex; flex-direction: column; }
+            .fb-title { font-size: 13.5px; font-weight: 650; color: var(--text-primary); letter-spacing: -0.01em; line-height: 1.2; }
+            .fb-ver { font-size: 10px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+            .fb-head-right { display: flex; align-items: center; gap: 8px; }
+            .fb-status-pill {
+                display: inline-flex; align-items: center; gap: 6px;
+                font-size: 11px; font-weight: 600; color: var(--text-muted);
+                background: rgba(255, 255, 255, 0.04); border: 1px solid var(--border-hair);
+                padding: 3px 9px; border-radius: 999px; font-variant-numeric: tabular-nums;
             }
-            .fb-title-dot.active {
-                background: #34d399;
-                box-shadow: 0 0 8px #34d399;
-            }
-            .fb-title {
-                font-size: 13.5px;
-                font-weight: 700;
-                color: #ffffff;
-            }
-
+            .fb-title-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-dim); transition: background .2s ease; }
+            .fb-title-dot.active { background: var(--ok); box-shadow: 0 0 8px rgba(52, 211, 153, 0.75); }
+            .fb-title-dot.checking { background: var(--accent); box-shadow: 0 0 8px rgba(155, 123, 247, 0.85); }
+            .fb-title-dot.cooldown { background: var(--warn); box-shadow: 0 0 8px rgba(251, 191, 36, 0.75); }
             .fb-close {
-                width: 24px;
-                height: 24px;
-                border-radius: 7px;
-                background: rgba(255, 255, 255, 0.05);
-                border: none;
-                color: #a49fb5;
-                cursor: pointer;
-                display: grid;
-                place-items: center;
-                font-size: 14px;
-                line-height: 1;
-                transition: all .14s ease;
+                width: 26px; height: 26px; border-radius: 8px;
+                background: rgba(255, 255, 255, 0.04); border: 1px solid var(--border-hair);
+                color: var(--text-muted); cursor: pointer; display: grid; place-items: center;
+                transition: background .15s ease, color .15s ease, border-color .15s ease;
             }
-            .fb-close:hover {
-                background: rgba(255, 255, 255, 0.12);
-                color: #ffffff;
-            }
+            .fb-close:hover { background: rgba(255, 255, 255, 0.1); color: #ffffff; border-color: rgba(255, 255, 255, 0.18); }
 
-            /* ── ВЕРХНИЕ ВКЛАДКИ (TOP TABS) ── */
+            /* ── Верхние вкладки (Segmented Control) ── */
+            .fb-tabs-wrap { padding: 10px 14px 0; }
             .fb-top-tabs {
-                display: flex;
-                gap: 4px;
-                padding: 6px 12px;
-                background: rgba(0, 0, 0, 0.25);
-                border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+                display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px;
+                padding: 3px; border-radius: 10px;
+                background: rgba(255, 255, 255, 0.025);
+                border: 1px solid var(--border-hair);
                 user-select: none;
             }
             .fb-top-tab {
-                flex: 1;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                gap: 6px;
-                padding: 7px 10px;
-                border-radius: 8px;
-                border: 1px solid transparent;
-                background: transparent;
-                color: #9490a5;
-                font-size: 11.5px;
-                font-weight: 600;
-                cursor: pointer;
-                transition: all .15s ease;
+                display: flex; align-items: center; justify-content: center; gap: 6px;
+                padding: 7px 8px; border-radius: 7px; border: 1px solid transparent;
+                background: transparent; color: var(--text-muted);
+                font-size: 12px; font-weight: 550; cursor: pointer;
+                transition: color .15s ease, background .15s ease, border-color .15s ease;
             }
-            .fb-top-tab:hover {
-                color: #ffffff;
-                background: rgba(255, 255, 255, 0.04);
-            }
+            .fb-top-tab:hover { color: var(--text-primary); background: rgba(255, 255, 255, 0.03); }
             .fb-top-tab.active {
-                color: #ffffff;
-                background: rgba(139, 92, 246, 0.22);
-                border-color: rgba(139, 92, 246, 0.4);
-                box-shadow: 0 0 12px rgba(139, 92, 246, 0.2);
+                color: var(--text-primary); font-weight: 600;
+                background: var(--accent-soft);
+                border-color: rgba(155, 123, 247, 0.28);
             }
-            .fb-top-tab svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; }
+            .fb-top-tab svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; opacity: 0.85; }
+            .fb-top-tab.active svg { color: var(--accent-bright); opacity: 1; }
 
             /* ── Тело окна ── */
-            .fb-body {
-                padding: 14px 16px;
-                display: flex;
-                flex-direction: column;
-                gap: 12px;
-                min-height: 220px;
-            }
+            .fb-body { padding: 14px 14px 16px; display: flex; flex-direction: column; gap: 11px; }
 
-            /* ── Карточки ── */
+            /* ── Телеметрия (2 метрики) ── */
+            .fb-metrics { display: grid; grid-template-columns: repeat(2, 1fr); gap: 9px; }
+            .fb-metric {
+                background: var(--bg-surface); border: 1px solid var(--border-hair);
+                border-radius: 12px; padding: 11px 13px;
+                display: flex; flex-direction: column; gap: 2px;
+                box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+            }
+            .fb-metric-label { font-size: 11px; color: var(--text-muted); font-weight: 550; }
+            .fb-metric-val { font-size: 21px; font-weight: 700; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; line-height: 1.2; margin-top: 2px; }
+            .fb-metric-val.ok { color: var(--ok); }
+            .fb-metric-val.warn { color: var(--warn); }
+
+            /* ── Панель запуска ── */
+            .fb-run-bar {
+                display: flex; align-items: center; justify-content: space-between; gap: 10px;
+                padding: 10px 12px; border-radius: 12px;
+                background: linear-gradient(135deg, rgba(155, 123, 247, 0.09), rgba(255, 255, 255, 0.02));
+                border: 1px solid rgba(155, 123, 247, 0.22);
+            }
+            .fb-run-info { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+            .fb-run-title { font-size: 12px; font-weight: 600; color: var(--text-primary); font-variant-numeric: tabular-nums; }
+            .fb-run-sub { font-size: 10.5px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+            .fb-action-btn {
+                background: linear-gradient(180deg, #a78bfa 0%, #8b5cf6 100%);
+                border: 1px solid rgba(255, 255, 255, 0.22);
+                border-radius: 9px; color: #ffffff;
+                font-size: 11.5px; font-weight: 600;
+                padding: 7px 12px; cursor: pointer;
+                display: inline-flex; align-items: center; gap: 6px;
+                white-space: nowrap; flex-shrink: 0;
+                transition: transform .15s ease, filter .15s ease, box-shadow .15s ease;
+            }
+            .fb-action-btn:hover { filter: brightness(1.06); transform: translateY(-1px); box-shadow: 0 6px 16px rgba(139, 92, 246, 0.35); }
+            .fb-action-btn:disabled { opacity: 0.55; cursor: not-allowed; transform: none; box-shadow: none; }
+
+            /* ── Карточки настроек ── */
             .fb-card {
-                background: rgba(255, 255, 255, 0.025);
-                border: 1px solid rgba(255, 255, 255, 0.06);
-                border-radius: 12px;
-                padding: 10px 12px;
-                display: flex;
-                flex-direction: column;
-                gap: 8px;
+                background: var(--bg-surface); border: 1px solid var(--border-hair);
+                border-radius: 12px; padding: 12px 13px;
+                display: flex; flex-direction: column; gap: 10px;
             }
+            .fb-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+            .fb-divider { border-top: 1px solid rgba(255, 255, 255, 0.055); padding-top: 10px; }
+            .fb-label { font-size: 12.5px; font-weight: 600; color: var(--text-primary); }
+            .fb-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; line-height: 1.35; }
 
-            .fb-row {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                gap: 10px;
-            }
-            .fb-label {
-                font-size: 12.5px;
-                font-weight: 600;
-                color: #ffffff;
-            }
-            .fb-sub {
-                font-size: 10.5px;
-                color: #837e96;
-                margin-top: 1px;
-            }
-
-            /* ── Тумблер ── */
-            .fb-switch {
-                position: relative;
-                display: inline-block;
-                width: 38px;
-                height: 20px;
-                flex-shrink: 0;
-            }
+            .fb-switch { position: relative; display: inline-block; width: 38px; height: 22px; flex-shrink: 0; }
             .fb-switch input { opacity: 0; width: 0; height: 0; }
-            .fb-slider {
-                position: absolute;
-                cursor: pointer;
-                inset: 0;
-                background-color: rgba(255, 255, 255, 0.12);
-                transition: .2s;
-                border-radius: 20px;
-                border: 1px solid rgba(255, 255, 255, 0.08);
-            }
-            .fb-slider:before {
-                position: absolute;
-                content: "";
-                height: 14px;
-                width: 14px;
-                left: 2px;
-                bottom: 2px;
-                background-color: #ffffff;
-                transition: .2s;
-                border-radius: 50%;
-            }
-            .fb-switch input:checked + .fb-slider {
-                background: linear-gradient(135deg, #8b5cf6, #7c3aed);
-                border-color: #a78bfa;
-            }
-            .fb-switch input:checked + .fb-slider:before {
-                transform: translateX(18px);
+            .fb-slider { position: absolute; cursor: pointer; inset: 0; background: #222434; transition: .18s ease; border-radius: 999px; border: 1px solid rgba(255, 255, 255, 0.12); }
+            .fb-slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 2px; top: 2px; background: #b4b7c9; transition: .18s cubic-bezier(0.16, 1, 0.3, 1); border-radius: 50%; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45); }
+            .fb-switch input:checked + .fb-slider { background: var(--accent); border-color: rgba(196, 181, 253, 0.55); box-shadow: 0 0 12px rgba(155, 123, 247, 0.35); }
+            .fb-switch input:checked + .fb-slider:before { transform: translateX(16px); background: #ffffff; }
+
+            .fb-foot-note {
+                display: flex; align-items: center; justify-content: center; gap: 6px;
+                font-size: 10.5px; color: var(--text-dim); text-align: center; padding-top: 2px;
             }
 
-            /* ── Блок списков ── */
+            /* ── Списки (белый / чёрный) ── */
             .fb-list-pills {
-                display: flex;
-                gap: 6px;
-                background: rgba(0, 0, 0, 0.25);
-                padding: 3px;
-                border-radius: 9px;
+                display: grid; grid-template-columns: repeat(2, 1fr); gap: 5px;
+                background: rgba(255, 255, 255, 0.025); border: 1px solid var(--border-hair);
+                padding: 3px; border-radius: 10px;
             }
             .fb-pill {
-                flex: 1;
-                padding: 6px 8px;
-                border: none;
-                border-radius: 7px;
-                background: transparent;
-                font-size: 11.5px;
-                font-weight: 600;
-                color: #8c879d;
-                cursor: pointer;
-                transition: all .16s ease;
-                text-align: center;
+                padding: 6px 8px; border: 1px solid transparent; border-radius: 7px;
+                background: transparent; font-size: 11.5px; font-weight: 600;
+                color: var(--text-muted); cursor: pointer; text-align: center;
+                transition: all .15s ease;
             }
-            .fb-pill:hover { color: #ffffff; }
-            .fb-pill.active.white {
-                background: rgba(52, 211, 153, 0.2);
-                color: #6ee7b7;
-            }
-            .fb-pill.active.black {
-                background: rgba(239, 68, 68, 0.2);
-                color: #fca5a5;
-            }
+            .fb-pill:hover { color: var(--text-primary); }
+            .fb-pill.active.white { background: var(--ok-soft); border-color: rgba(52, 211, 153, 0.28); color: #6ee7b7; }
+            .fb-pill.active.black { background: var(--danger-soft); border-color: rgba(248, 113, 113, 0.28); color: #fca5a5; }
 
-            .fb-add-row {
-                display: flex;
-                gap: 6px;
-            }
+            .fb-add-row { display: flex; gap: 6px; }
             .fb-input {
-                flex: 1;
-                background: rgba(0, 0, 0, 0.35);
-                border: 1px solid rgba(255, 255, 255, 0.1);
-                border-radius: 7px;
-                padding: 6px 10px;
-                color: #ffffff;
-                font-size: 11.5px;
-                outline: none;
-                transition: border-color .14s ease;
+                flex: 1; background: var(--bg-input);
+                border: 1px solid var(--border-hair); border-radius: 9px;
+                padding: 8px 11px; color: var(--text-primary); font-size: 12px; outline: none;
+                transition: border-color .15s ease, box-shadow .15s ease;
             }
-            .fb-input:focus { border-color: #8b5cf6; }
-
+            .fb-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(155, 123, 247, 0.15); }
+            .fb-input::placeholder { color: var(--text-dim); }
             .fb-add-btn {
-                background: #8b5cf6;
-                border: none;
-                border-radius: 7px;
-                padding: 0 12px;
-                color: #ffffff;
-                font-size: 14px;
-                font-weight: 700;
-                cursor: pointer;
-                transition: opacity .14s ease;
+                background: linear-gradient(180deg, #a78bfa 0%, #8b5cf6 100%);
+                border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 9px;
+                padding: 0 13px; color: #ffffff; font-size: 12px; font-weight: 600;
+                cursor: pointer; transition: filter .15s ease; white-space: nowrap;
             }
-            .fb-add-btn:hover { opacity: 0.9; }
+            .fb-add-btn:hover { filter: brightness(1.08); }
 
-            .fb-tags-wrap {
-                display: flex;
-                flex-wrap: wrap;
-                gap: 5px;
-                max-height: 110px;
-                overflow-y: auto;
-                padding-top: 2px;
+            .fb-tags-card {
+                background: var(--bg-surface); border: 1px solid var(--border-hair);
+                border-radius: 12px; padding: 11px 12px; min-height: 126px;
+                display: flex; flex-direction: column; justify-content: space-between; gap: 8px;
             }
+            .fb-tags-wrap { display: flex; flex-wrap: wrap; gap: 6px; max-height: 130px; overflow-y: auto; align-content: flex-start; }
             .fb-tag {
-                display: inline-flex;
-                align-items: center;
-                gap: 5px;
-                padding: 3px 8px;
-                border-radius: 6px;
-                font-size: 11px;
-                font-weight: 500;
+                display: inline-flex; align-items: center; gap: 6px;
+                padding: 4px 8px; border-radius: 7px; font-size: 11.5px; font-weight: 550;
             }
-            .fb-tag.whitelist {
-                background: rgba(52, 211, 153, 0.12);
-                border: 1px solid rgba(52, 211, 153, 0.3);
-                color: #6ee7b7;
-            }
-            .fb-tag.blacklist {
-                background: rgba(239, 68, 68, 0.12);
-                border: 1px solid rgba(239, 68, 68, 0.3);
-                color: #fca5a5;
-            }
+            .fb-tag.whitelist { background: var(--ok-soft); border: 1px solid rgba(52, 211, 153, 0.28); color: #6ee7b7; }
+            .fb-tag.blacklist { background: var(--danger-soft); border: 1px solid rgba(248, 113, 113, 0.28); color: #fca5a5; }
             .fb-tag button {
-                background: transparent;
-                border: none;
-                color: inherit;
-                cursor: pointer;
-                font-size: 12px;
-                line-height: 1;
-                opacity: 0.6;
+                background: transparent; border: none; color: inherit; cursor: pointer;
+                font-size: 13px; line-height: 1; opacity: 0.65; padding: 0 1px;
+                transition: opacity .12s ease;
             }
             .fb-tag button:hover { opacity: 1; }
-            .fb-empty-hint {
-                font-size: 11px;
-                color: #69657b;
-                font-style: italic;
-                padding: 4px 0;
-            }
+            .fb-empty-hint { font-size: 11.5px; color: var(--text-dim); line-height: 1.45; padding: 14px 4px; text-align: center; width: 100%; }
+            .fb-list-foot { display: flex; justify-content: flex-end; border-top: 1px solid rgba(255, 255, 255, 0.05); padding-top: 7px; }
+            .fb-link-btn { background: transparent; border: none; color: var(--text-muted); font-size: 11px; cursor: pointer; transition: color .14s ease; }
+            .fb-link-btn:hover { color: var(--danger); }
 
-            /* ── Кнопки и действия ── */
-            .fb-action-btn {
-                background: linear-gradient(135deg, #8b5cf6, #7c3aed);
-                border: none;
-                border-radius: 8px;
-                color: #ffffff;
-                font-size: 11.5px;
-                font-weight: 600;
-                padding: 8px 12px;
-                cursor: pointer;
-                transition: transform .14s ease, opacity .14s ease;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                gap: 6px;
-                width: 100%;
+            /* ── Журнал (таймлайн) ── */
+            .fb-j-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+            .fb-j-filters { display: inline-flex; gap: 3px; background: rgba(255, 255, 255, 0.025); border: 1px solid var(--border-hair); border-radius: 8px; padding: 2px; }
+            .fb-j-filter { border: none; background: transparent; color: var(--text-muted); font-size: 11px; font-weight: 600; padding: 4px 8px; border-radius: 6px; cursor: pointer; }
+            .fb-j-filter.active { background: var(--accent-soft); color: var(--accent-bright); }
+            .fb-j-clear {
+                background: rgba(255, 255, 255, 0.04); border: 1px solid var(--border-hair);
+                color: var(--text-muted); border-radius: 7px; padding: 4px 9px; font-size: 11px;
+                cursor: pointer; transition: background .14s ease, color .14s ease;
             }
-            .fb-action-btn:hover { opacity: 0.92; transform: translateY(-1px); }
-            .fb-action-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
-
-            /* ── Журнал ── */
+            .fb-j-clear:hover { background: rgba(255, 255, 255, 0.09); color: var(--text-primary); }
             .fb-journal-list {
-                display: flex;
-                flex-direction: column;
-                gap: 5px;
-                max-height: 170px;
-                overflow-y: auto;
+                display: flex; flex-direction: column;
+                max-height: 205px; overflow-y: auto;
+                background: var(--bg-surface); border: 1px solid var(--border-hair);
+                border-radius: 11px;
             }
             .fb-journal-item {
-                background: rgba(0, 0, 0, 0.25);
-                border-radius: 7px;
-                padding: 6px 8px;
-                font-size: 11px;
-                display: flex;
-                align-items: center;
-                gap: 8px;
+                display: flex; align-items: flex-start; gap: 8px;
+                padding: 8px 11px; font-size: 11.5px; line-height: 1.4;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.045);
             }
-            .fb-journal-item.success { border-left: 2px solid #34d399; }
-            .fb-journal-item.warn { border-left: 2px solid #f87171; }
-            .fb-journal-item.info { border-left: 2px solid #8b5cf6; }
-            .fb-journal-time { color: #69647d; font-family: monospace; font-size: 10px; }
-            .fb-journal-text { color: #ded9ec; flex: 1; word-break: break-word; }
+            .fb-journal-item:last-child { border-bottom: none; }
+            .fb-journal-dot { width: 6px; height: 6px; border-radius: 50%; margin-top: 5px; flex-shrink: 0; background: var(--accent); }
+            .fb-journal-item.success .fb-journal-dot { background: var(--ok); }
+            .fb-journal-item.warn .fb-journal-dot { background: var(--warn); }
+            .fb-journal-time { color: var(--text-dim); font-variant-numeric: tabular-nums; font-size: 10.5px; width: 48px; flex-shrink: 0; margin-top: 1px; }
+            .fb-journal-text { color: #e2e4ef; flex: 1; min-width: 0; word-break: break-word; }
 
             /* ── Тост ── */
             .fb-toast {
-                position: fixed;
-                bottom: 24px;
-                left: 24px;
-                z-index: 2147483647;
-                background: rgba(24, 24, 32, 0.96);
-                border: 1px solid rgba(139, 92, 246, 0.4);
-                border-left: 3px solid #8b5cf6;
-                border-radius: 10px;
-                padding: 8px 12px;
-                color: #ffffff;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.5);
-                font-size: 11.5px;
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                cursor: pointer;
+                position: fixed; bottom: 20px; left: 20px; z-index: 2147483647;
+                background: linear-gradient(145deg, rgba(20, 21, 33, 0.96), rgba(11, 12, 19, 0.98));
+                backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+                border: 1px solid rgba(52, 211, 153, 0.35);
+                border-radius: 12px; padding: 9px 13px;
+                color: #ffffff; box-shadow: 0 16px 38px rgba(0, 0, 0, 0.65);
+                font-size: 12px; font-weight: 550;
+                display: flex; align-items: center; gap: 9px; cursor: pointer;
                 animation: fbPopIn .18s ease forwards;
+            }
+            @media (prefers-reduced-motion: reduce) {
+                *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
             }
         `;
         shadow.appendChild(style);
 
-        // Кнопка (дизайн идентичен кнопке чата AnimeOn)
-        const btn = document.createElement('div');
+        const btn = document.createElement('button');
+        btn.type = 'button';
         btn.className = 'fb-btn';
-        btn.setAttribute('title', 'Взаимная автоподписка');
+        btn.setAttribute('title', 'AON Followback');
+        btn.setAttribute('aria-label', 'Открыть AON Followback');
         btn.innerHTML = `
             <svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><polyline points="16 11 18 13 22 9"/></svg>
             <span class="fb-btn-dot ${settings.enabled ? 'active' : ''}"></span>
         `;
         shadow.appendChild(btn);
 
-        // Окно с верхними кнопками
         const win = document.createElement('div');
         win.className = 'fb-window';
         win.innerHTML = `
             <div class="fb-head" id="fb-win-head">
-                <div class="fb-title-wrap">
-                    <span class="fb-title-dot ${settings.enabled ? 'active' : ''}" id="fb-title-dot"></span>
-                    <span class="fb-title">Автоподписка</span>
+                <div class="fb-head-left">
+                    <div class="fb-brand-icon">
+                        <svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><polyline points="16 11 18 13 22 9"/></svg>
+                    </div>
+                    <div class="fb-title-group">
+                        <span class="fb-title">AON Followback</span>
+                        <span class="fb-ver">v${SCRIPT_VERSION} · безопасный режим</span>
+                    </div>
                 </div>
-                <button class="fb-close" id="fb-win-close" title="Закрыть">&times;</button>
+                <div class="fb-head-right">
+                    <span class="fb-status-pill">
+                        <span class="fb-title-dot ${settings.enabled ? 'active' : ''}" id="fb-title-dot"></span>
+                        <span id="fb-head-status">${settings.enabled ? 'Активно' : 'Выкл'}</span>
+                    </span>
+                    <button class="fb-close" id="fb-win-close" title="Закрыть">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                    </button>
+                </div>
             </div>
 
-            <!-- ВЕРХНИЕ ВКЛАДКИ -->
-            <div class="fb-top-tabs">
-                <button class="fb-top-tab active" data-tab="main">
-                    <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
-                    <span>Настройки</span>
-                </button>
-                <button class="fb-top-tab" data-tab="lists">
-                    <svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
-                    <span>Списки</span>
-                </button>
-                <button class="fb-top-tab" data-tab="journal">
-                    <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-                    <span>Журнал</span>
-                </button>
+            <div class="fb-tabs-wrap">
+                <div class="fb-top-tabs">
+                    <button class="fb-top-tab active" data-tab="main">
+                        <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/></svg>
+                        <span>Управление</span>
+                    </button>
+                    <button class="fb-top-tab" data-tab="lists">
+                        <svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
+                        <span>Списки</span>
+                    </button>
+                    <button class="fb-top-tab" data-tab="journal">
+                        <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+                        <span>Журнал</span>
+                    </button>
+                </div>
             </div>
 
             <div class="fb-body" id="fb-win-body"></div>
         `;
         shadow.appendChild(win);
 
-        document.body.appendChild(widgetRoot);
+        hostParent.appendChild(widgetRoot);
 
         let btnJustDragged = false;
         setupDraggable(btn, BTN_POS_KEY, null, () => {
             btnJustDragged = true;
-            setTimeout(() => { btnJustDragged = false; }, 150);
+            setTimeout(() => { btnJustDragged = false; }, 160);
         });
         setupDraggable(win, MODAL_POS_KEY, win.querySelector('#fb-win-head'));
 
-        // Клик по плавающей кнопке (с защитой от случайного открытия при перетаскивании)
         btn.addEventListener('click', (e) => {
             e.stopPropagation();
             if (btnJustDragged) return;
@@ -1285,11 +1284,15 @@
 
         win.querySelector('#fb-win-close').addEventListener('click', () => safeToggleModal(false));
 
-        window.addEventListener('keydown', (e) => {
+        on(window, 'keydown', (e) => {
             if (e.key === 'Escape' && isModalOpen) safeToggleModal(false);
         });
 
-        // Переключение верхних вкладок
+        on(window, 'resize', () => {
+            clampToViewport(btn);
+            clampToViewport(win);
+        });
+
         win.querySelectorAll('.fb-top-tab').forEach(tBtn => {
             tBtn.addEventListener('click', () => {
                 win.querySelectorAll('.fb-top-tab').forEach(b => b.classList.remove('active'));
@@ -1315,6 +1318,7 @@
         isModalOpen = typeof open === 'boolean' ? open : win.style.display !== 'flex';
         win.style.display = isModalOpen ? 'flex' : 'none';
         if (isModalOpen) {
+            clampToViewport(win);
             renderTabContent();
         }
         updateUI();
@@ -1326,7 +1330,6 @@
         if (!body) return;
 
         const curTab = settings.activeTab || 'main';
-
         shadow.querySelectorAll('.fb-top-tab').forEach(b => {
             b.classList.toggle('active', b.dataset.tab === curTab);
         });
@@ -1335,12 +1338,32 @@
             const stats = getFbStats();
 
             body.innerHTML = `
-                <!-- Тумблер 1: Взаимная подписка -->
+                <div class="fb-metrics">
+                    <div class="fb-metric">
+                        <span class="fb-metric-label">Взаимных подписок</span>
+                        <span class="fb-metric-val ok" id="fb-stat-followed">+${stats.followedTotal || 0}</span>
+                    </div>
+                    <div class="fb-metric">
+                        <span class="fb-metric-label">Зеркальных отписок</span>
+                        <span class="fb-metric-val warn" id="fb-stat-unfollowed">-${stats.unfollowedTotal || 0}</span>
+                    </div>
+                </div>
+
+                <div class="fb-run-bar">
+                    <div class="fb-run-info">
+                        <span class="fb-run-title" id="fb-status-text">${esc(getStatusText())}</span>
+                        <span class="fb-run-sub" id="fb-last-check">${stats.lastCheckText ? `Последняя проверка в ${esc(stats.lastCheckText)}` : 'Ещё не проверялось'}</span>
+                    </div>
+                    <button class="fb-action-btn" id="fb-btn-check-now"${fbIsChecking ? ' disabled' : ''}>
+                        ${fbIsChecking ? '⏳ Проверка…' : '▶ Проверить'}
+                    </button>
+                </div>
+
                 <div class="fb-card">
                     <div class="fb-row">
                         <div>
-                            <div class="fb-label">Взаимная подписка</div>
-                            <div class="fb-sub">Подписываться в ответ на читателей</div>
+                            <div class="fb-label">Автоподписка в ответ</div>
+                            <div class="fb-sub">Подписываться на новых читателей</div>
                         </div>
                         <label class="fb-switch">
                             <input type="checkbox" id="fb-toggle-enabled" ${settings.enabled ? 'checked' : ''}>
@@ -1348,35 +1371,20 @@
                         </label>
                     </div>
 
-                    <div style="border-top: 1px solid rgba(255,255,255,0.06); padding-top: 8px;">
-                        <div class="fb-row">
-                            <div>
-                                <div class="fb-label">Зеркальная отписка</div>
-                                <div class="fb-sub">Отписываться, если читатель отписался</div>
-                            </div>
-                            <label class="fb-switch">
-                                <input type="checkbox" id="fb-toggle-unfollow" ${settings.unfollowEnabled ? 'checked' : ''}>
-                                <span class="fb-slider"></span>
-                            </label>
+                    <div class="fb-row fb-divider">
+                        <div>
+                            <div class="fb-label">Зеркальная отписка</div>
+                            <div class="fb-sub">Отписываться от отписавшихся (кроме белого списка)</div>
                         </div>
+                        <label class="fb-switch">
+                            <input type="checkbox" id="fb-toggle-unfollow" ${settings.unfollowEnabled ? 'checked' : ''}>
+                            <span class="fb-slider"></span>
+                        </label>
                     </div>
                 </div>
 
-                <!-- Статус и счетчик -->
-                <div class="fb-card">
-                    <div class="fb-row">
-                        <span style="font-size: 11px; color: #a49fb5;" id="fb-status-text">${getStatusText()}</span>
-                        <span style="font-size: 11px; font-weight: 600; color: #6ee7b7; font-family: monospace;" id="fb-stats-mini">
-                            +${stats.followedTotal || 0} / -${stats.unfollowedTotal || 0}
-                        </span>
-                    </div>
-                    <button class="fb-action-btn" id="fb-btn-check-now" style="margin-top: 2px;">
-                        <span>▶</span> Проверить сейчас (до 5)
-                    </button>
-                </div>
-
-                <div style="font-size: 10.5px; color: #726d83; line-height: 1.4; text-align: center;">
-                    Безопасный режим: проверка раз в 5 минут, не более 5 действий за раз, человеческие паузы 1.5–3.5с.
+                <div class="fb-foot-note">
+                    <span>До 5 действий каждые 5 минут · Паузы 1.5–3.5с между запросами</span>
                 </div>
             `;
 
@@ -1384,7 +1392,7 @@
                 settings.enabled = e.target.checked;
                 saveSettings({ enabled: e.target.checked });
                 if (settings.enabled) scheduleNextCheck(10);
-                else if (fbTimer) { clearTimeout(fbTimer); fbTimer = null; fbNextCheckTs = 0; }
+                else scheduleNextCheck();
                 updateUI();
             });
 
@@ -1395,14 +1403,8 @@
             });
 
             body.querySelector('#fb-btn-check-now').addEventListener('click', async () => {
-                const btnEl = body.querySelector('#fb-btn-check-now');
-                if (btnEl) { btnEl.disabled = true; btnEl.textContent = '⏳ Проверка…'; }
-                try {
-                    await performFollowbackCheck(true);
-                } finally {
-                    if (btnEl) { btnEl.disabled = false; btnEl.innerHTML = '<span>▶</span> Проверить сейчас (до 5)'; }
-                    renderTabContent();
-                }
+                await performFollowbackCheck(true);
+                if (isModalOpen && (settings.activeTab || 'main') === 'main') renderTabContent();
             });
 
         } else if (curTab === 'lists') {
@@ -1421,19 +1423,20 @@
                 </div>
 
                 <div class="fb-add-row">
-                    <input type="text" class="fb-input" id="fb-input-nick" placeholder="${activeListTab === 'white' ? 'Иммунитет от отписки...' : 'Игнор (без взаимки)...'}">
-                    <button class="fb-add-btn" id="fb-btn-add" title="Добавить">+</button>
+                    <input type="text" class="fb-input" id="fb-input-nick" placeholder="${activeListTab === 'white' ? 'Ник, @username или ссылка (можно через запятую)…' : 'Ник или ссылка для игнора (можно через запятую)…'}">
+                    <button class="fb-add-btn" id="fb-btn-add">Добавить</button>
                 </div>
 
-                <div class="fb-card" style="min-height: 120px;">
+                <div class="fb-tags-card">
                     <div class="fb-tags-wrap" id="fb-tags-container">
                         ${currentList.length ? currentList.map(name => `
                             <div class="fb-tag ${activeListTab === 'white' ? 'whitelist' : 'blacklist'}">
-                                <span>${escapeHtml(name)}</span>
-                                <button data-del="${escapeHtml(name)}" title="Удалить">&times;</button>
+                                <span>${esc(name)}</span>
+                                <button data-del="${esc(name)}" title="Удалить">&times;</button>
                             </div>
-                        `).join('') : `<div class="fb-empty-hint">${activeListTab === 'white' ? 'Белый список пуст. Скрипт никогда не отпишется от этих пользователей.' : 'Чёрный список пуст. Скрипт никогда не подпишется на них в ответ.'}</div>`}
+                        `).join('') : `<div class="fb-empty-hint">${activeListTab === 'white' ? 'Белый список пуст. Этих пользователей скрипт никогда не удалит при зеркальной отписке.' : 'Чёрный список пуст. На этих пользователей скрипт не будет подписываться в ответ.'}</div>`}
                     </div>
+                    ${currentList.length ? `<div class="fb-list-foot"><button class="fb-link-btn" id="fb-btn-clear-list">Очистить список</button></div>` : ''}
                 </div>
             `;
 
@@ -1447,16 +1450,13 @@
             });
 
             const inEl = body.querySelector('#fb-input-nick');
-            const addBtn = body.querySelector('#fb-btn-add');
             const doAdd = () => {
                 if (!inEl || !inEl.value.trim()) return;
-                const val = inEl.value.trim();
-                if (activeListTab === 'white') addToWhitelist(val);
-                else addToBlacklist(val);
+                addNamesToList(inEl.value, activeListTab === 'white');
                 inEl.value = '';
                 renderTabContent();
             };
-            addBtn.addEventListener('click', doAdd);
+            body.querySelector('#fb-btn-add').addEventListener('click', doAdd);
             inEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') doAdd(); });
 
             body.querySelectorAll('[data-del]').forEach(btn => {
@@ -1468,24 +1468,46 @@
                 });
             });
 
+            body.querySelector('#fb-btn-clear-list')?.addEventListener('click', () => {
+                if (activeListTab === 'white') saveWhitelist([]);
+                else saveBlacklist([]);
+                addJournalEntry(`Очищен ${activeListTab === 'white' ? 'белый' : 'чёрный'} список`, 'info', 'system');
+                renderTabContent();
+            });
+
         } else if (curTab === 'journal') {
-            const items = getJournal();
+            const allItems = getJournal();
+            const items = journalFilter === 'all'
+                ? allItems
+                : allItems.filter(it => (it.kind || 'system') === journalFilter);
 
             body.innerHTML = `
-                <div style="display: flex; align-items: center; justify-content: space-between;">
-                    <span style="font-size: 11.5px; color: #a49fb5; font-weight: 600;">Записей: ${items.length}</span>
-                    <button id="fb-btn-clear-j" style="background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); color: #ded9ec; border-radius: 6px; padding: 4px 8px; font-size: 10.5px; cursor: pointer;">Очистить</button>
+                <div class="fb-j-toolbar">
+                    <div class="fb-j-filters">
+                        <button class="fb-j-filter${journalFilter === 'all' ? ' active' : ''}" data-jf="all">Все (<span id="fb-journal-count">${allItems.length}</span>)</button>
+                        <button class="fb-j-filter${journalFilter === 'follow' ? ' active' : ''}" data-jf="follow">Подписки</button>
+                        <button class="fb-j-filter${journalFilter === 'unfollow' ? ' active' : ''}" data-jf="unfollow">Отписки</button>
+                    </div>
+                    <button class="fb-j-clear" id="fb-btn-clear-j">Очистить</button>
                 </div>
 
                 <div class="fb-journal-list">
                     ${items.length ? items.map(it => `
-                        <div class="fb-journal-item ${it.type || 'info'}">
-                            <span class="fb-journal-time">${it.time}</span>
-                            <span class="fb-journal-text">${escapeHtml(it.text)}</span>
+                        <div class="fb-journal-item ${esc(it.type || 'info')}">
+                            <span class="fb-journal-dot"></span>
+                            <span class="fb-journal-time">${esc(it.time)}</span>
+                            <span class="fb-journal-text">${esc(it.text)}</span>
                         </div>
-                    `).join('') : '<div class="fb-empty-hint" style="text-align:center; padding: 20px 0;">Журнал пуст</div>'}
+                    `).join('') : '<div class="fb-empty-hint">Пока нет записей в этой категории</div>'}
                 </div>
             `;
+
+            body.querySelectorAll('.fb-j-filter').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    journalFilter = btn.dataset.jf || 'all';
+                    renderTabContent();
+                });
+            });
 
             body.querySelector('#fb-btn-clear-j').addEventListener('click', () => {
                 clearJournal();
@@ -1504,8 +1526,8 @@
         const toast = document.createElement('div');
         toast.className = 'fb-toast';
         toast.innerHTML = `
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><polyline points="16 11 18 13 22 9"/></svg>
-            <span>${escapeHtml(text)}</span>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#34d399" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><polyline points="16 11 18 13 22 9"/></svg>
+            <span>${esc(text)}</span>
         `;
         toast.addEventListener('click', () => toast.remove());
         shadow.appendChild(toast);
@@ -1523,8 +1545,8 @@
             const saved = localStorage.getItem(storageKey);
             if (saved) {
                 const { x, y } = JSON.parse(saved);
-                const width = el.offsetWidth || (el.classList.contains('fb-window') ? 380 : 28);
-                const height = el.offsetHeight || (el.classList.contains('fb-window') ? 300 : 28);
+                const width = el.offsetWidth || (el.classList.contains('fb-window') ? 416 : 38);
+                const height = el.offsetHeight || (el.classList.contains('fb-window') ? 320 : 38);
                 const safeX = Math.max(10, Math.min(window.innerWidth - width - 10, x));
                 const safeY = Math.max(10, Math.min(window.innerHeight - height - 10, y));
                 el.style.left = safeX + 'px';
@@ -1552,7 +1574,7 @@
             if (!isDown) return;
             const dx = e.clientX - startX;
             const dy = e.clientY - startY;
-            if (Math.abs(dx) > 7 || Math.abs(dy) > 7) hasMoved = true;
+            if (Math.abs(dx) > 6 || Math.abs(dy) > 6) hasMoved = true;
             if (hasMoved) {
                 const newX = Math.max(10, Math.min(window.innerWidth - el.offsetWidth - 10, origX + dx));
                 const newY = Math.max(10, Math.min(window.innerHeight - el.offsetHeight - 10, origY + dy));
@@ -1581,41 +1603,73 @@
         dragHandle.addEventListener('pointercancel', onUp);
     }
 
+    function getCooldownUntil() {
+        try { return Number(localStorage.getItem(COOLDOWN_KEY)) || 0; } catch (e) { return 0; }
+    }
+
     function getStatusText() {
-        if (!settings.enabled) return 'Выключено';
-        if (fbIsChecking) return 'Проверка…';
+        if (!settings.enabled) return 'Автопроверка выключена';
+        if (fbIsChecking) return 'Идёт проверка…';
 
         const now = Date.now();
-        let cooldownUntil = 0;
-        try { cooldownUntil = Number(localStorage.getItem(COOLDOWN_KEY)) || 0; } catch (e) {}
+        const cooldownUntil = getCooldownUntil();
         if (cooldownUntil && now < cooldownUntil) {
-            return `Лимит (429): ${formatSecsToHuman(Math.ceil((cooldownUntil - now) / 1000))}`;
+            return `Пауза API (429): ${formatSecsToHuman(Math.ceil((cooldownUntil - now) / 1000))}`;
         }
 
         if (fbNextCheckTs && fbNextCheckTs > now) {
             const rem = Math.max(0, Math.round((fbNextCheckTs - now) / 1000));
-            return `Через ${formatSecsToHuman(rem)}`;
+            return `Следующая проверка через ${formatSecsToHuman(rem)}`;
         }
-        return 'Ожидание…';
+        return 'Ожидание цикла…';
+    }
+
+    function setTextIfChanged(el, val) {
+        const s = String(val);
+        if (el && el.textContent !== s) el.textContent = s;
     }
 
     function updateUI() {
-        if (!shadow) return;
+        if (fbStopped || !shadow) return;
+
+        const now = Date.now();
+        const cooldownActive = getCooldownUntil() > now;
 
         const dot = shadow.querySelector('.fb-btn-dot');
-        if (dot) dot.classList.toggle('active', settings.enabled);
+        if (dot) {
+            dot.classList.toggle('active', settings.enabled && !fbIsChecking);
+            dot.classList.toggle('checking', fbIsChecking);
+        }
 
         const titleDot = shadow.querySelector('#fb-title-dot');
-        if (titleDot) titleDot.classList.toggle('active', settings.enabled);
+        if (titleDot) {
+            titleDot.classList.toggle('active', settings.enabled && !fbIsChecking && !cooldownActive);
+            titleDot.classList.toggle('checking', fbIsChecking);
+            titleDot.classList.toggle('cooldown', cooldownActive && !fbIsChecking);
+        }
+
+        const headStatus = shadow.querySelector('#fb-head-status');
+        if (headStatus) {
+            const label = fbIsChecking ? 'Проверка' : (cooldownActive ? 'Пауза 429' : (settings.enabled ? 'Активно' : 'Выкл'));
+            setTextIfChanged(headStatus, label);
+        }
 
         if (isModalOpen && (settings.activeTab || 'main') === 'main') {
-            const statusEl = shadow.querySelector('#fb-status-text');
-            if (statusEl) statusEl.textContent = getStatusText();
+            setTextIfChanged(shadow.querySelector('#fb-status-text'), getStatusText());
 
-            const statsEl = shadow.querySelector('#fb-stats-mini');
-            if (statsEl) {
-                const stats = getFbStats();
-                statsEl.textContent = `+${stats.followedTotal || 0} / -${stats.unfollowedTotal || 0}`;
+            const stats = getFbStats();
+            setTextIfChanged(shadow.querySelector('#fb-stat-followed'), `+${stats.followedTotal || 0}`);
+            setTextIfChanged(shadow.querySelector('#fb-stat-unfollowed'), `-${stats.unfollowedTotal || 0}`);
+            setTextIfChanged(
+                shadow.querySelector('#fb-last-check'),
+                stats.lastCheckText ? `Последняя проверка в ${stats.lastCheckText}` : 'Ещё не проверялось'
+            );
+
+            const btnNow = shadow.querySelector('#fb-btn-check-now');
+            if (btnNow) {
+                btnNow.disabled = fbIsChecking;
+                const label = fbIsChecking ? '⏳ Проверка…' : '▶ Проверить';
+                setTextIfChanged(btnNow, label);
             }
         }
     }
@@ -1624,24 +1678,44 @@
     // 11. СТАРТ И ИНИЦИАЛИЗАЦИЯ
     // ─────────────────────────────────────────────────────────────
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', ensureWidget, { once: true });
+        on(document, 'DOMContentLoaded', ensureWidget, { once: true });
     } else {
         ensureWidget();
     }
 
     setInterval(() => {
-        if (document.body && widgetRoot && !document.body.contains(widgetRoot)) {
-            document.body.appendChild(widgetRoot);
+        const hostParent = document.body || document.documentElement;
+        if (hostParent && widgetRoot && !widgetRoot.isConnected) {
+            hostParent.appendChild(widgetRoot);
         }
         updateUI();
     }, 1000);
+
+    function stop() {
+        if (fbStopped) return;
+        fbStopped = true;
+        releaseFollowbackLock();
+        for (const id of fbIntervals) window.clearInterval(id);
+        for (const id of fbTimeouts) window.clearTimeout(id);
+        fbIntervals.clear();
+        fbTimeouts.clear();
+        for (const [target, type, fn, opts] of fbListeners) {
+            try { target.removeEventListener(type, fn, opts); } catch (e) {}
+        }
+        fbListeners.length = 0;
+        try { if (widgetRoot) widgetRoot.remove(); } catch (e) {}
+        widgetRoot = null;
+        shadow = null;
+        try { delete window.__AON_FOLLOWBACK_LOADED__; } catch (e) {}
+    }
 
     try {
         window.__AON_FOLLOWBACK__ = {
             toggle: () => safeToggleModal(),
             open: () => safeToggleModal(true),
             close: () => safeToggleModal(false),
-            checkNow: () => performFollowbackCheck(true)
+            checkNow: () => performFollowbackCheck(true),
+            stop
         };
     } catch (e) {}
 
