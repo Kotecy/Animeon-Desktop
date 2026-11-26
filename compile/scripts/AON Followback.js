@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AON Followback
 // @namespace    https://animeon.co/
-// @version      1.4.0
+// @version      1.4.1
 // @description  Взаимная автоподписка для AnimeOn
 // @match        https://animeon.cc/*
 // @match        https://www.animeon.cc/*
@@ -28,7 +28,7 @@
         window.__AON_FOLLOWBACK_LOADED__ = true;
     }
 
-    const SCRIPT_VERSION = '1.4.0';
+    const SCRIPT_VERSION = '1.4.1';
     let fbStopped = false;
     const fbIntervals = new Set();
     const fbTimeouts = new Set();
@@ -84,7 +84,7 @@
     const TAB_ID = 'fb_tab_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
 
     const FOLLOWBACK_PAGE_SIZE = 50;
-    const FOLLOWBACK_MAX_PAGES = 10;
+    const FOLLOWBACK_MAX_PAGES = 30;
     const CHECK_INTERVAL_SEC = 300; // 5 минут
     const MAX_ACTIONS_PER_RUN = 5;  // Не более 5 действий за цикл
     const MAX_NAMEMAP_ENTRIES = 1000;
@@ -606,6 +606,11 @@
 
         fbIsChecking = true;
         updateUI();
+        let nextDelaySec;
+        let activeOwnSlug = null;
+        let activeDoneSet = null;
+        let followedCount = 0;
+        let unfollowedCount = 0;
 
         try {
             const ownSlug = await resolveOwnUsernameSlug();
@@ -613,6 +618,7 @@
                 if (isManual) addJournalEntry('Ошибка: не удалось определить аккаунт (войдите на сайт)', 'warn', 'system');
                 return;
             }
+            activeOwnSlug = ownSlug;
 
             await humanDelay(600, 1200);
             if (fbStopped) return;
@@ -636,6 +642,7 @@
 
             const followingSet = new Set(followingData.slugs || []);
             const doneSet = getFbDoneSet(ownSlug);
+            activeDoneSet = doneSet;
             const listsComplete = Boolean(followingData.complete && followersData.complete);
 
             const whitelist = new Set(getWhitelist().map(s => normalizeName(s).toLowerCase().trim()));
@@ -674,7 +681,6 @@
             let actionsDone = 0;
 
             // Зеркальная отписка (с иммунитетом для белого списка)
-            let unfollowedCount = 0;
             if (settings.unfollowEnabled && actionsDone < MAX_ACTIONS_PER_RUN) {
                 const suspiciousEmpty = allFollowers.length === 0 && totalFollowers > 0;
                 if (!listsComplete || suspiciousEmpty) {
@@ -741,7 +747,6 @@
                 toFollow.push({ ...u, _slug: slug, _orig: slugRaw, _disp: disp });
             }
 
-            let followedCount = 0;
             if (toFollow.length > 0 && actionsDone < MAX_ACTIONS_PER_RUN) {
                 const batch = toFollow.slice(0, MAX_ACTIONS_PER_RUN - actionsDone);
 
@@ -775,17 +780,6 @@
                 }
             }
 
-            saveFbDoneSet(ownSlug, doneSet);
-
-            const curStats = getFbStats();
-            const timeStr = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-            updateFbStats({
-                followedTotal: (curStats.followedTotal || 0) + followedCount,
-                unfollowedTotal: (curStats.unfollowedTotal || 0) + unfollowedCount,
-                lastCheckTs: Date.now(),
-                lastCheckText: timeStr
-            });
-
             if (isManual && followedCount === 0 && unfollowedCount === 0) {
                 addJournalEntry('Проверка: всё синхронно, новых подписчиков нет', 'info', 'system');
             }
@@ -794,13 +788,25 @@
             if (err.message === 'RATE_LIMIT') {
                 const cool = Date.now() + 15 * 60 * 1000;
                 try { localStorage.setItem(COOLDOWN_KEY, String(cool)); } catch (e) {}
+                nextDelaySec = 15 * 60 + 10;
                 addJournalEntry('Лимит API (429). Пауза 15 минут.', 'warn', 'system');
             }
         } finally {
+            if (activeOwnSlug && activeDoneSet) {
+                saveFbDoneSet(activeOwnSlug, activeDoneSet);
+                const curStats = getFbStats();
+                const timeStr = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+                updateFbStats({
+                    followedTotal: (curStats.followedTotal || 0) + followedCount,
+                    unfollowedTotal: (curStats.unfollowedTotal || 0) + unfollowedCount,
+                    lastCheckTs: Date.now(),
+                    lastCheckText: timeStr
+                });
+            }
             releaseFollowbackLock();
             fbIsChecking = false;
             updateUI();
-            scheduleNextCheck();
+            scheduleNextCheck(nextDelaySec);
         }
     }
 
@@ -1146,7 +1152,15 @@
                 border-radius: 12px; padding: 11px 12px; min-height: 126px;
                 display: flex; flex-direction: column; justify-content: space-between; gap: 8px;
             }
-            .fb-tags-wrap { display: flex; flex-wrap: wrap; gap: 6px; max-height: 130px; overflow-y: auto; align-content: flex-start; }
+            .fb-tags-wrap, .fb-journal-list {
+                overflow-y: auto !important; overflow-x: hidden; overscroll-behavior: contain;
+                scrollbar-width: thin !important; scrollbar-color: rgba(155, 123, 247, 0.38) transparent !important;
+            }
+            .fb-tags-wrap::-webkit-scrollbar, .fb-journal-list::-webkit-scrollbar { display: block !important; width: 5px !important; height: 5px !important; }
+            .fb-tags-wrap::-webkit-scrollbar-track, .fb-journal-list::-webkit-scrollbar-track { background: transparent !important; }
+            .fb-tags-wrap::-webkit-scrollbar-thumb, .fb-journal-list::-webkit-scrollbar-thumb { background: rgba(155, 123, 247, 0.35) !important; border-radius: 999px !important; }
+            .fb-tags-wrap::-webkit-scrollbar-thumb:hover, .fb-journal-list::-webkit-scrollbar-thumb:hover { background: rgba(155, 123, 247, 0.58) !important; }
+            .fb-tags-wrap { display: flex; flex-wrap: wrap; gap: 6px; max-height: 130px; align-content: flex-start; }
             .fb-tag {
                 display: inline-flex; align-items: center; gap: 6px;
                 padding: 4px 8px; border-radius: 7px; font-size: 11.5px; font-weight: 550;
@@ -1177,7 +1191,7 @@
             .fb-j-clear:hover { background: rgba(255, 255, 255, 0.09); color: var(--text-primary); }
             .fb-journal-list {
                 display: flex; flex-direction: column;
-                max-height: 205px; overflow-y: auto;
+                max-height: 225px;
                 background: var(--bg-surface); border: 1px solid var(--border-hair);
                 border-radius: 11px;
             }
@@ -1185,6 +1199,7 @@
                 display: flex; align-items: flex-start; gap: 8px;
                 padding: 8px 11px; font-size: 11.5px; line-height: 1.4;
                 border-bottom: 1px solid rgba(255, 255, 255, 0.045);
+                flex-shrink: 0;
             }
             .fb-journal-item:last-child { border-bottom: none; }
             .fb-journal-dot { width: 6px; height: 6px; border-radius: 50%; margin-top: 5px; flex-shrink: 0; background: var(--accent); }
@@ -1284,9 +1299,19 @@
 
         win.querySelector('#fb-win-close').addEventListener('click', () => safeToggleModal(false));
 
-        on(window, 'keydown', (e) => {
-            if (e.key === 'Escape' && isModalOpen) safeToggleModal(false);
-        });
+        ['keydown', 'keyup', 'keypress'].forEach(ev => on(window, ev, (e) => {
+            const inside = Boolean(widgetRoot && e.composedPath().includes(widgetRoot));
+            if (ev === 'keydown' && e.key === 'Escape' && isModalOpen) {
+                if (inside) e.stopImmediatePropagation();
+                safeToggleModal(false);
+                return;
+            }
+            if (!inside) return;
+            e.stopImmediatePropagation();
+            if (ev === 'keydown' && e.key === 'Enter' && e.composedPath()[0]?.id === 'fb-input-nick') {
+                shadow?.querySelector('#fb-btn-add')?.click();
+            }
+        }, true));
 
         on(window, 'resize', () => {
             clampToViewport(btn);
@@ -1457,7 +1482,6 @@
                 renderTabContent();
             };
             body.querySelector('#fb-btn-add').addEventListener('click', doAdd);
-            inEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') doAdd(); });
 
             body.querySelectorAll('[data-del]').forEach(btn => {
                 btn.addEventListener('click', () => {
