@@ -42,8 +42,8 @@ function checkSanitizer() {
   // У каждой встроенной секретки — код сайта, иконка и награда; иконка есть в приложении
   const icons = JSON.parse(fs.readFileSync(path.join(root, 'src/shared/secretIcons.json'), 'utf8')).icons
   for (const item of catalog.sanitizeSecretsCatalog(bundled).secrets) {
-    // Без кода — только секретки «условия уточняются», которых ещё нет у владельца
-    if (!item.code) { assert.equal(item.unconfirmed, true, item.name + ': нет кода'); continue }
+    // Секретки без кода (ещё не открыты на аккаунте владельца) должны иметь подсказку и гайд
+    if (!item.code) { assert.ok(item.desc && item.steps, item.name + ': нет подсказки/гайда'); continue }
     assert.match(item.code, /^secret_[a-z0-9_]+$/, item.name + ': плохой код')
     assert.ok(item.icon && icons[item.icon], item.name + ': нет иконки')
     assert.ok(Number.isInteger(item.trophies) && Number.isInteger(item.animon), item.name + ': нет награды')

@@ -239,6 +239,9 @@ async function run() {
     await page.getByRole('dialog').getByRole('button',{name:'Закрыть',exact:true}).click()
     // «Условия уточняются» — только у секреток с пометкой в secrets.json
     await page.getByRole('button',{name:'Как получить: Ва-банк'}).click()
+    assert.doesNotMatch(await page.getByRole('dialog').innerText(), /Условия уточняются/)
+    await page.getByRole('dialog').getByRole('button',{name:'Закрыть',exact:true}).click()
+    await page.getByRole('button',{name:'Как получить: Опенинг — святое'}).click()
     assert.match(await page.getByRole('dialog').innerText(), /Условия уточняются/)
     await page.getByRole('dialog').getByRole('button',{name:'Закрыть',exact:true}).click()
     // Гайд с разметкой: разделы, списки и ссылки на сайт по выбранному адресу
